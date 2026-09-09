@@ -12,7 +12,7 @@ This version uses `PySide6` for a more modern desktop UI.
 - Lets you save only a selected section, like `9:32` to `9:43`
 - Lets you download the full range with a dedicated toggle
 - Shows a simple log so you can see what `yt-dlp` is doing
-- Checks on startup whether required tools are present and refreshes Python-based downloader dependencies in development mode
+- Checks required tools at startup and installs missing Python dependencies in development mode
 - Accepts YouTube links, Twitch VODs, Twitch clips, and other sites supported by `yt-dlp`
 - Uses `TwitchDownloaderCLI` for Twitch VOD ranges and Twitch clips
 - Uses a bundled PO-token provider for YouTube's current high-quality `mweb` path
@@ -41,3 +41,15 @@ This version uses `PySide6` for a more modern desktop UI.
 - The installer build bundles Python, yt-dlp, ffmpeg, `node.exe`, `TwitchDownloaderCLI`, and required Python dependencies.
 - Installed builds default to `Documents\MerchTools\Video Downloader` for each user instead of writing inside Program Files.
 - `update_config.json` is bundled into packaged builds, so set its `manifest_url` before making your release installer.
+
+## Updating development dependencies
+
+Installed dependencies are reused at startup. To update them deliberately, run
+this command in the app virtual environment:
+
+```bash
+python -m pip install --upgrade -r requirements.txt imageio-ffmpeg bgutil-ytdlp-pot-provider
+```
+
+The activity panel retains the latest 1,000 text blocks. The complete raw log
+continues to be written to disk.

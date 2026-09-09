@@ -38,7 +38,7 @@ from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError, download_range_func
 from yt_dlp.downloader import external as yt_dlp_external
 from PySide6.QtCore import QObject, QPoint, QEvent, QThread, Qt, Signal, QTimer
-from PySide6.QtGui import QColor, QFont, QFontDatabase, QIcon, QPainter, QPen, QPixmap, QPolygon
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QIcon, QPainter, QPen, QPixmap, QPolygon, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QBoxLayout,
@@ -1046,9 +1046,8 @@ class DependencyWorker(BaseWorker):
             if self.is_frozen():
                 self.log("Running as a packaged app. Skipping pip-based setup.")
             else:
-                self.ensure_pip_available()
                 for module_name, package_name in REQUIRED_PYTHON_PACKAGES:
-                    self.ensure_latest_package(module_name, package_name)
+                    self.ensure_package(module_name, package_name)
 
             ffmpeg_path = self.resolve_ffmpeg_executable()
             if not ffmpeg_path:
@@ -1088,13 +1087,13 @@ class DependencyWorker(BaseWorker):
             if result.returncode != 0:
                 raise RuntimeError(result.stderr.strip() or "ensurepip failed.")
 
-    def ensure_latest_package(self, module_name: str, package_name: str) -> None:
+    def ensure_package(self, module_name: str, package_name: str) -> None:
         if self.module_available(module_name):
-            self.log(f"Checking for {package_name} updates...")
-        else:
-            self.log(f"Installing missing package: {package_name}")
+            return
+        self.ensure_pip_available()
+        self.log(f"Installing missing package: {package_name}")
         process = subprocess.Popen(
-            [sys.executable, "-m", "pip", "install", "--upgrade", package_name],
+            [sys.executable, "-m", "pip", "install", package_name],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -1111,7 +1110,7 @@ class DependencyWorker(BaseWorker):
 
         exit_code = process.wait()
         if exit_code != 0:
-            raise RuntimeError(f"Updating {package_name} failed with exit code {exit_code}.")
+            raise RuntimeError(f"Installing {package_name} failed with exit code {exit_code}.")
 
     def module_available(self, module_name: str) -> bool:
         try:
@@ -2471,7 +2470,6 @@ class MainWindow(QMainWindow):
         self._youtube_warning_logged = False
         self._last_display_log: str | None = None
         self._last_activity_phase: str | None = None
-        self.activity_entries: list[str] = []
         self.layout_mode = "default"
         self.ui_scale = 1.0
         self.root_widget: QWidget | None = None
@@ -2741,6 +2739,8 @@ class MainWindow(QMainWindow):
 
         self.log_output = QTextEdit()
         self.log_output.setReadOnly(True)
+        self.log_output.document().setMaximumBlockCount(1000)
+        self.log_output.document().setDocumentMargin(0)
         self.log_output.setObjectName("logOutput")
         self.activity_body_layout.addWidget(self.log_output, 1)
         right_layout.addWidget(self.activity_body, 1)
@@ -3043,8 +3043,7 @@ class MainWindow(QMainWindow):
         return handle.startSystemResize(self.resize_edges)
 
     def clear_activity_log(self) -> None:
-        self.activity_entries.clear()
-        self.refresh_activity_console()
+        self.log_output.clear()
         self._last_display_log = None
         self.append_log("Log cleared.")
 
@@ -3995,8 +3994,28 @@ class MainWindow(QMainWindow):
         if display_message == self._last_display_log:
             return
         self._last_display_log = display_message
-        self.activity_entries.append(self.render_activity_html(display_message))
-        self.refresh_activity_console()
+        scrollbar = self.log_output.verticalScrollBar()
+        follow_tail = scrollbar.value() >= scrollbar.maximum() - 2
+        anchor = self.log_output.cursorForPosition(QPoint(0, 0))
+        anchor_top = self.log_output.cursorRect(anchor).top()
+        selection = self.log_output.textCursor()
+        selection.setKeepPositionOnInsert(True)
+        selection_anchor = QTextCursor(selection)
+        selection_anchor.setPosition(selection.anchor())
+        selection_anchor.setKeepPositionOnInsert(True)
+        cursor = QTextCursor(self.log_output.document())
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        if not self.log_output.document().isEmpty():
+            cursor.insertBlock()
+        cursor.insertHtml(self.render_activity_html(display_message))
+        selection_position = selection.position()
+        selection.setPosition(selection_anchor.position())
+        selection.setPosition(selection_position, QTextCursor.MoveMode.KeepAnchor)
+        self.log_output.setTextCursor(selection)
+        if follow_tail:
+            scrollbar.setValue(scrollbar.maximum())
+        else:
+            scrollbar.setValue(scrollbar.value() + self.log_output.cursorRect(anchor).top() - anchor_top)
 
     def set_status(self, text: str) -> None:
         if text != "Downloading...":
@@ -4025,15 +4044,6 @@ class MainWindow(QMainWindow):
             f"<div style=\"font-family:'IBM Plex Mono','DM Mono'; font-size:{font_size}px; letter-spacing:0.04em; "
             f"line-height:{line_height:.2f}; color:{color}; font-weight:{weight};\">{text}</div>"
         )
-
-    def refresh_activity_console(self) -> None:
-        body = "".join(self.activity_entries)
-        self.log_output.setHtml(
-            "<html><body style=\"margin:0; background:#090909;\">"
-            f"{body}"
-            "</body></html>"
-        )
-        self.log_output.verticalScrollBar().setValue(self.log_output.verticalScrollBar().maximum())
 
     def refresh_update_button(self) -> None:
         if not hasattr(self, "check_updates_button"):
@@ -4526,7 +4536,7 @@ class MainWindow(QMainWindow):
             return
 
         if not self.is_frozen():
-            self.append_log("Checking for the latest yt-dlp and ffmpeg packages...")
+            self.append_log("Checking required downloader packages...")
 
         self.update_button_state()
         worker = DependencyWorker()
