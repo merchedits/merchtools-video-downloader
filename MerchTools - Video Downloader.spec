@@ -1,6 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_data_files
 
 try:
     import certifi as _certifi
@@ -37,7 +38,7 @@ a = Analysis(
         (str(project_root / "assets" / "app-icon.png"), "assets"),
         (str(project_root / "update_config.json"), "."),
         (str(project_root / "latest.example.json"), "."),
-    ] + font_datas + ([(str(certifi_cacert), "pip/_vendor/certifi")] if certifi_cacert and certifi_cacert.exists() else []),
+    ] + font_datas + collect_data_files('yt_dlp_ejs') + collect_data_files('yt_dlp_plugins', include_py_files=True) + ([(str(certifi_cacert), "pip/_vendor/certifi")] if certifi_cacert and certifi_cacert.exists() else []),
     hiddenimports=[
         'yt_dlp',
         'imageio_ffmpeg',

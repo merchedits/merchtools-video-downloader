@@ -37,6 +37,9 @@ except ImportError:
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError, download_range_func
 from yt_dlp.downloader import external as yt_dlp_external
+from yt_dlp.globals import all_plugins_loaded
+from yt_dlp.plugins import load_all_plugins
+from yt_dlp.postprocessor.ffmpeg import FFmpegPostProcessor
 from PySide6.QtCore import QObject, QPoint, QEvent, QThread, Qt, Signal, QTimer
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QIcon, QPainter, QPen, QPixmap, QPolygon, QTextCursor
 from PySide6.QtWidgets import (
@@ -79,9 +82,9 @@ TWITCH_DOWNLOADER_RELATIVE_PATH = Path("TwitchDownloaderCLI") / "TwitchDownloade
 BGUTIL_PROVIDER_SERVER_RELATIVE_PATH = Path("bgutil-ytdlp-pot-provider") / "server"
 DEFAULT_DOWNLOAD_FORMAT = "bestvideo*+bestaudio/best"
 REQUIRED_PYTHON_PACKAGES = [
-    ("yt_dlp", "yt-dlp"),
+    ("yt_dlp", "yt-dlp[default]"),
     ("imageio_ffmpeg", "imageio-ffmpeg"),
-    ("yt_dlp_plugins.extractor.getpot_bgutil_script", "bgutil-ytdlp-pot-provider"),
+    ("yt_dlp_plugins.extractor.getpot_bgutil_script", "bgutil-ytdlp-pot-provider==1.3.1"),
 ]
 HARDWARE_ENCODER_CACHE: dict[str, str | None] = {}
 PO_TOKEN_PROVIDER_IMPORT_ERROR: Exception | None = None
@@ -320,17 +323,16 @@ def ensure_po_token_provider_ready() -> bool:
     if PO_TOKEN_PROVIDER_READY is not None:
         return PO_TOKEN_PROVIDER_READY
 
-    if not getattr(sys, "frozen", False):
-        PO_TOKEN_PROVIDER_IMPORT_ERROR = None
-        PO_TOKEN_PROVIDER_READY = True
-        return True
-
     provider_modules = (
         "yt_dlp_plugins.extractor.getpot_bgutil",
         "yt_dlp_plugins.extractor.getpot_bgutil_http",
         "yt_dlp_plugins.extractor.getpot_bgutil_script",
     )
     try:
+        # Register providers through yt-dlp's loader before checking imports;
+        # importing them first causes duplicate registration on first download.
+        if not all_plugins_loaded.value:
+            load_all_plugins()
         for module_name in provider_modules:
             importlib.import_module(module_name)
     except Exception as exc:
@@ -364,11 +366,9 @@ def yt_dlp_js_runtime_options() -> dict:
         return {}
     provider_home = resolve_bgutil_provider_server_home()
     provider_ready = bool(provider_home) and ensure_po_token_provider_ready()
-    extractor_args: dict[str, dict[str, list[str]]] = {
-        "youtube": {
-            "player_client": ["mweb", "android_vr"] if provider_ready else ["web", "android_vr"],
-        }
-    }
+    # Let the bundled yt-dlp choose current working YouTube clients. Forcing
+    # older clients can produce URLs that fail with HTTP 403 at download time.
+    extractor_args: dict[str, dict[str, list[str]]] = {}
     if provider_ready:
         configure_po_token_environment()
         extractor_args["youtubepot-bgutilscript"] = {"server_home": [provider_home]}
@@ -1371,6 +1371,9 @@ class DownloadWorker(BaseWorker):
 
         original_popen = yt_dlp_external.Popen
         yt_dlp_external.Popen = self.make_tracking_popen(original_popen)
+        # The external downloader's availability check uses this context,
+        # even when YoutubeDL has an explicit ffmpeg_location option.
+        ffmpeg_location_token = FFmpegPostProcessor._ffmpeg_location.set(self.ffmpeg_path)
         try:
             def build_options(
                 cookie_entry: tuple[str, tuple[str, str | None, str | None, str | None]] | None = None,
@@ -1446,6 +1449,7 @@ class DownloadWorker(BaseWorker):
                 raise last_error
             return 1
         finally:
+            FFmpegPostProcessor._ffmpeg_location.reset(ffmpeg_location_token)
             yt_dlp_external.Popen = original_popen
             self.ffmpeg_process = None
             self.helper_process = None
@@ -1819,7 +1823,7 @@ class DownloadWorker(BaseWorker):
         class TrackingPopen(base_popen):
             def __init__(self, args, *remaining, **kwargs):
                 executable = str(args[0]).lower() if args else ""
-                is_ffmpeg = executable.endswith("ffmpeg") or executable.endswith("ffmpeg.exe")
+                is_ffmpeg = (executable.endswith("ffmpeg") or executable.endswith("ffmpeg.exe")) and "-i" in args
                 if is_ffmpeg:
                     kwargs["stderr"] = subprocess.PIPE
                     kwargs["stdout"] = subprocess.DEVNULL
@@ -1851,11 +1855,18 @@ class DownloadWorker(BaseWorker):
         thread.start()
 
     def on_ffmpeg_output(self, line: str) -> None:
-        if "=" not in line:
-            return
-
-        key, value = line.split("=", 1)
+        # FFmpeg diagnostics can also contain '=' (including media URLs).
+        # Only consume the known -progress keys as progress data.
+        progress_keys = {
+            "frame", "fps", "bitrate", "total_size", "out_time_us",
+            "out_time_ms", "out_time", "dup_frames", "drop_frames", "speed",
+            "progress",
+        }
+        key, separator, value = line.partition("=")
         key = key.strip()
+        if not separator or (key not in progress_keys and not re.fullmatch(r"stream_\d+_\d+_q", key)):
+            self.log(f"[ffmpeg] {line}")
+            return
         value = value.strip()
         self.ffmpeg_progress_state[key] = value
 

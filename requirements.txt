@@ -1,2 +1,2 @@
 PySide6>=6.8.0
-yt-dlp>=2025.1.15
+yt-dlp[default]>=2026.8.19

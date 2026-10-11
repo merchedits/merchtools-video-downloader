@@ -1,4 +1,4 @@
 {
-  "manifest_url": "https://merchedits.github.io/MerchTools_VideoDownloader/latest.json",
+  "manifest_url": "https://raw.githubusercontent.com/merchedits/merchtools-video-downloader/main/latest.json",
   "check_on_startup": true
 }

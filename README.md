@@ -48,8 +48,14 @@ Installed dependencies are reused at startup. To update them deliberately, run
 this command in the app virtual environment:
 
 ```bash
-python -m pip install --upgrade -r requirements.txt imageio-ffmpeg bgutil-ytdlp-pot-provider
+python -m pip install --upgrade -r requirements.txt imageio-ffmpeg "bgutil-ytdlp-pot-provider==1.3.1"
 ```
 
 The activity panel retains the latest 1,000 text blocks. The complete raw log
 continues to be written to disk.
+
+The PO-token plugin version must match the vendored server (currently 1.3.1).
+YouTube client selection follows the bundled yt-dlp defaults. Packaged builds
+include the JavaScript challenge solver and discoverable provider modules.
+The update manifest is served from the current repository's `main` branch;
+publish the matching installer release before pushing a new `latest.json`.
