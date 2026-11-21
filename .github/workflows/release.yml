@@ -142,14 +142,7 @@ jobs:
             @(
               "## What's Changed in $tag"
               ''
-              '- Auto-fills `0:00` in Start Time when you enter an End Time.'
-              '- Replaced the blocking download-completed modal popup with a non-blocking notification sound.'
-              '- Removed the Secret Menu (Kittycat and Classic UI options).'
-              '- Added automatic background updates for `yt-dlp` (+ `yt-dlp-ejs`) and `TwitchDownloaderCLI` inside user app data so extractor fixes apply without shipping a new installer.'
-              '- `Reveal in Explorer` now selects the exact downloaded file on Windows.'
-              '- Auto-generated clip filenames include the clip range (`Title [00-00 - 00-10].mp4`) and auto-increment duplicate names instead of prompting to overwrite.'
-              '- Automatically retries with CPU encoding if hardware encoding fails at runtime.'
-              '- Refreshed bundled `bgutil-ytdlp-pot-provider` to `2.0.2`, `TwitchDownloaderCLI` to `1.56.5`, and `yt-dlp` to `2026.10.26`.'
+              '- Updated the app and Windows installer icon (`assets/app-icon.png` / `assets/app-icon.ico`) with a cleaner MerchTools dark + electric-lime design.'
               ''
               "Download **MerchToolsVideoDownloaderSetup.exe** to install or upgrade, or extract **MerchToolsVideoDownloader-$env:APP_VERSION-portable.zip** to run portable."
             ) -join "`n" | Set-Content -Path $notesFile -Encoding utf8
