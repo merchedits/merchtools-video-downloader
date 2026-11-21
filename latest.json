@@ -1,6 +1,6 @@
 {
-  "version": "1.0.11",
-  "installer_url": "https://github.com/merchedits/merchtools-video-downloader/releases/download/v1.0.11/MerchToolsVideoDownloaderSetup.exe",
+  "version": "1.0.12",
+  "installer_url": "https://github.com/merchedits/merchtools-video-downloader/releases/download/v1.0.12/MerchToolsVideoDownloaderSetup.exe",
   "filename": "MerchToolsVideoDownloaderSetup.exe",
-  "notes": "Fixed the update manifest address after the repository rename, refreshed the YouTube downloader and challenge solver, restored bundled FFmpeg detection for clip downloads, and preserved FFmpeg diagnostics."
+  "notes": "Auto-fills 0:00 start time when an end time is entered, replaces the download-complete modal popup with a notification sound, removes the Secret Menu (Kittycat/Classic UI), adds automatic background updates for yt-dlp (+ yt-dlp-ejs) and TwitchDownloaderCLI, selects downloaded files directly in Explorer, avoids overwrite prompts with range-tagged and auto-incremented filenames, retries with CPU encoding if hardware encoding fails, and refreshes bundled bgutil-ytdlp-pot-provider (2.0.2) and TwitchDownloaderCLI (1.56.5)."
 }
