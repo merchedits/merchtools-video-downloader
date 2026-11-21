@@ -27,7 +27,7 @@ The provider comes in two parts:
 1. yt-dlp `2025.05.22` or above.
 
 2. If using Docker image for option (a) for the provider, the Docker runtime is required.  
-   Otherwise, Node.js (>= 20) or Deno (>= 2.0.0) is required. You will also need git to clone the repository.
+   Otherwise, Node.js (>= 22) or Deno (>= 2.0.0) is required. You will also need git to clone the repository.
 
 ### 1. Set up the provider
 
@@ -36,8 +36,8 @@ There are two options for the provider, an always running POT generation HTTP se
 You need to first install the repository unless you are using the Docker image for the HTTP server:
 
 ```shell
-# Replace 1.3.1 with the latest version or the one that matches the plugin
-git clone --single-branch --branch 1.3.1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git
+# Replace 2.0.2 with the latest version or the one that matches the plugin
+git clone --single-branch --branch 2.0.2 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git
 cd bgutil-ytdlp-pot-provider/server/
 # If you are using Node:
 npm ci
@@ -48,17 +48,21 @@ deno install --allow-scripts=npm:canvas --frozen
 
 #### (a) HTTP Server Option
 
-This is a JavaScript HTTP server, on port 4416 by default. You have two options for running it: as a prebuilt Docker image, or manually as a JavaScript application.
+This is a JavaScript HTTP server on port 4416 by default. When run natively, it binds to localhost only (`127.0.0.1` / `::1`). You have two options for running it: as a prebuilt Docker image, or manually as a JavaScript application.
 
 **Docker:**
 
-Port 4416 is exposed to the host system by default. Pass `-p 1234:4416` in the docker run options (before the image name) to publish the server to port 1234 on the host system. Replace `[OPTIONS]` with the server command line options (usually this is not needed because you can use docker to publish the server to another port).
+The Docker image binds the server to all interfaces inside the container so that port forwarding works. Publish it only to the host's IPv4 loopback interface:
 
 ```shell
-docker run --name bgutil-provider -d --init brainicism/bgutil-ytdlp-pot-provider [OPTIONS]
+docker run --name bgutil-provider -d --init \
+  -p 127.0.0.1:4416:4416 brainicism/bgutil-ytdlp-pot-provider
 ```
 
-Our Docker image comes in two flavors: Node.js or Deno. The `:latest` tag defaults to Node.js, but you can specify an alternate version/flavor like so: `brainicism/bgutil-ytdlp-pot-provider:1.3.1-deno`. The `:node` tag also points to the latest Node.js image, and `:deno` points to the latest Deno image.
+> [!WARNING]
+> Omitting `127.0.0.1` from the port mapping publishes the server on all host interfaces by default. This may allow untrusted local or external clients to access the unauthenticated server, generate tokens, consume system and network resources and potentially perform RCE.
+
+Our Docker image comes in two flavors: Node.js or Deno. The `:latest` tag defaults to Node.js, but you can specify an alternate version/flavor like so: `brainicism/bgutil-ytdlp-pot-provider:2.0.2-deno`. The `:node` tag also points to the latest Node.js image, and `:deno` points to the latest Deno image.
 
 > [!IMPORTANT]
 > Note that the docker container's network is isolated from your local network by default. If you are using a local proxy server, it will not be accessible from within the container unless you pass `--net=host` as well.
@@ -83,6 +87,7 @@ deno run --allow-env --allow-net --allow-ffi=. --allow-read=. ../src/main.ts [OP
 **Server Command Line Options**
 
 - `-p, --port <PORT>`: The port on which the server listens.
+- `-H, --host <HOST>`: Host/IP to listen on. Repeat it or separate values with commas to bind multiple addresses. Defaults to localhost only (`127.0.0.1` and `::1`).
 
 #### (b) Generation Script Option
 
@@ -110,7 +115,7 @@ python3 -m pip install -U bgutil-ytdlp-pot-provider
 
 If using option (a) HTTP Server for the provider, and the default IP/port number (http://127.0.0.1:4416), you can use yt-dlp like normal 🙂.
 
-If changing the port or IP used for the provider server, pass it to yt-dlp via `base_url`
+If the provider server is reachable at a different URL, pass it to yt-dlp via `base_url`:
 
 ```shell
 --extractor-args "youtubepot-bgutilhttp:base_url=http://127.0.0.1:8080"
@@ -142,8 +147,25 @@ If both methods are available for use, the option (a) HTTP server method will be
 To check if the plugin was installed correctly, you should see the `bgutil` providers in yt-dlp's verbose output: `yt-dlp -v YOUTUBE_URL`.
 
 ```
-[debug] [youtube] [pot] PO Token Providers: bgutil:http-1.3.1 (external), bgutil:script-node-1.3.1 (external), bgutil:script-deno-1.3.1 (external, unavailable)
+[debug] [youtube] [pot] PO Token Providers: bgutil:http-2.0.2 (external), bgutil:script-node-2.0.2 (external), bgutil:script-deno-2.0.2 (external, unavailable)
 ```
+
+This only confirms that yt-dlp loaded the plugin. To confirm that a PO Token was actually requested and generated, also look for a line like one of these in the same output:
+
+```
+[youtube] [pot:bgutil:http] Generating a gvs PO Token for web client via bgutil HTTP server
+[youtube] [pot:bgutil:script-node] Generating a gvs PO Token for web client via bgutil script
+```
+
+(the context and client may differ, e.g. `player` instead of `gvs`, or `tv` instead of `web`).
+
+If the providers are listed but no `Generating a ... PO Token` line ever appears, the PO Token flow was never triggered. This usually means the selected player clients failed earlier (e.g. with `LOGIN_REQUIRED`) before reaching a step that needs a PO Token, so the provider itself is not the problem. Try a different set of player clients, for example:
+
+```shell
+--extractor-args "youtube:player-client=mweb,tv,web_safari"
+```
+
+Also note that a PO Token does not bypass IP-based login restrictions. If you still get "Sign in to confirm you're not a bot" after a token was generated (common on datacenter IPs), you additionally need to pass cookies; see #37.
 
 ### FAQ
 

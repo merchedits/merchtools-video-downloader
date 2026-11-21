@@ -1,3 +1,7 @@
+param(
+    [switch]$SkipLatestVersionCheck
+)
+
 $ErrorActionPreference = "Stop"
 
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -41,7 +45,7 @@ if (-not $IsccPath) {
     throw "Inno Setup Compiler (ISCC.exe) was not found. Install Inno Setup 6 first."
 }
 
-if (Test-Path $LatestJsonPath) {
+if (-not $SkipLatestVersionCheck -and (Test-Path $LatestJsonPath)) {
     $LatestManifest = Get-Content $LatestJsonPath -Raw | ConvertFrom-Json
     if ([string]$LatestManifest.version -ne $AppVersion) {
         throw "latest.json version ($($LatestManifest.version)) does not match app version ($AppVersion)."

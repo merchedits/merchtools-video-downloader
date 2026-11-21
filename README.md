@@ -9,10 +9,12 @@ This version uses `PySide6` for a more modern desktop UI.
 - Downloads the highest quality video and audio that the active backend can get
 - Merges video output into `mp4`
 - Can export audio-only downloads as `wav`
-- Lets you save only a selected section, like `9:32` to `9:43`
+- Lets you save only a selected section, like `9:32` to `9:43` (typing only an end time automatically fills `0:00` as the start time)
 - Lets you download the full range with a dedicated toggle
 - Shows a simple log so you can see what `yt-dlp` is doing
+- Plays a notification sound when a download completes without blocking the window with a modal popup
 - Checks required tools at startup and installs missing Python dependencies in development mode
+- Automatically updates `yt-dlp` (with its matching `yt-dlp-ejs` solver) and `TwitchDownloaderCLI` in the background into user app data, even in packaged builds
 - Accepts YouTube links, Twitch VODs, Twitch clips, and other sites supported by `yt-dlp`
 - Uses `TwitchDownloaderCLI` for Twitch VOD ranges and Twitch clips
 - Uses a bundled PO-token provider for YouTube's current high-quality `mweb` path
@@ -36,8 +38,9 @@ This version uses `PySide6` for a more modern desktop UI.
 - Packaged builds bundle CA certificates so HTTPS downloads work more reliably on clean machines.
 - Packaged builds also bundle the UI fonts used by the app.
 - Start and end time support `SS`, `MM:SS`, and `HH:MM:SS`.
-- If you leave the filename empty, the video title is used automatically.
-- Hardware acceleration is automatic where supported and falls back to CPU encoding when it is not available.
+- If you leave the filename empty (or unchanged from the auto-filled title), clipped downloads include the clip range (for example `Title [00-00 - 00-10].mp4`), and any duplicate filename automatically increments (`(2)`, `(3)`, ...) instead of prompting to overwrite.
+- `Reveal in Explorer` selects the exact downloaded file on Windows.
+- Hardware acceleration is automatic where supported and automatically retries with CPU encoding if the GPU encoder fails at runtime.
 - The installer build bundles Python, yt-dlp, ffmpeg, `node.exe`, `TwitchDownloaderCLI`, and required Python dependencies.
 - Installed builds default to `Documents\MerchTools\Video Downloader` for each user instead of writing inside Program Files.
 - `update_config.json` is bundled into packaged builds, so set its `manifest_url` before making your release installer.
@@ -48,13 +51,13 @@ Installed dependencies are reused at startup. To update them deliberately, run
 this command in the app virtual environment:
 
 ```bash
-python -m pip install --upgrade -r requirements.txt imageio-ffmpeg "bgutil-ytdlp-pot-provider==1.3.1"
+python -m pip install --upgrade -r requirements.txt imageio-ffmpeg "bgutil-ytdlp-pot-provider==2.0.2"
 ```
 
 The activity panel retains the latest 1,000 text blocks. The complete raw log
 continues to be written to disk.
 
-The PO-token plugin version must match the vendored server (currently 1.3.1).
+The PO-token plugin version must match the vendored server (currently 2.0.2).
 YouTube client selection follows the bundled yt-dlp defaults. Packaged builds
 include the JavaScript challenge solver and discoverable provider modules.
 The update manifest is served from the current repository's `main` branch;

@@ -1,20 +1,16 @@
 import html
 import importlib
 import json
-import math
 import os
 import configparser
-import random
 import re
 import shutil
-import struct
 import ssl
 import subprocess
 import sys
 import tempfile
 import threading
 import time
-import wave
 import ctypes
 from datetime import datetime
 from pathlib import Path
@@ -34,14 +30,90 @@ except ImportError:
     except ImportError:
         certifi = None
 
-from yt_dlp import YoutubeDL
-from yt_dlp.utils import DownloadError, download_range_func
-from yt_dlp.downloader import external as yt_dlp_external
-from yt_dlp.globals import all_plugins_loaded
-from yt_dlp.plugins import load_all_plugins
-from yt_dlp.postprocessor.ffmpeg import FFmpegPostProcessor
+import tool_updater
+from tool_updater import (
+    ToolUpdateOutcome,
+    is_newer_version,
+    subprocess_window_options,
+    user_data_dir,
+    version_key,
+)
+
+YT_DLP_BOOTSTRAP_WARNING: str | None = None
+_BOOTSTRAPPED_YT_DLP_ROOT = tool_updater.bootstrap_managed_python_packages()
+
+YoutubeDL = None  # type: ignore[assignment]
+DownloadError = Exception  # type: ignore[assignment]
+download_range_func = None  # type: ignore[assignment]
+yt_dlp_external = None  # type: ignore[assignment]
+all_plugins_loaded = None  # type: ignore[assignment]
+load_all_plugins = None  # type: ignore[assignment]
+FFmpegPostProcessor = None  # type: ignore[assignment]
+
+
+def _import_yt_dlp_symbols() -> None:
+    global YoutubeDL, DownloadError, download_range_func
+    global yt_dlp_external, all_plugins_loaded, load_all_plugins, FFmpegPostProcessor
+
+    from yt_dlp import YoutubeDL as _YoutubeDL
+    from yt_dlp.utils import DownloadError as _DownloadError, download_range_func as _download_range_func
+    from yt_dlp.downloader import external as _yt_dlp_external
+    from yt_dlp.globals import all_plugins_loaded as _all_plugins_loaded
+    from yt_dlp.plugins import load_all_plugins as _load_all_plugins
+    from yt_dlp.postprocessor.ffmpeg import FFmpegPostProcessor as _FFmpegPostProcessor
+
+    YoutubeDL = _YoutubeDL
+    DownloadError = _DownloadError
+    download_range_func = _download_range_func
+    yt_dlp_external = _yt_dlp_external
+    all_plugins_loaded = _all_plugins_loaded
+    load_all_plugins = _load_all_plugins
+    FFmpegPostProcessor = _FFmpegPostProcessor
+
+
+def active_yt_dlp_version() -> str:
+    try:
+        version_mod = importlib.import_module("yt_dlp.version")
+        return str(getattr(version_mod, "__version__", "") or "").strip() or "0.0.0"
+    except Exception:  # noqa: BLE001
+        return "0.0.0"
+
+
+def reload_yt_dlp_runtime(new_root: Path | None) -> str:
+    """Switch the active managed yt-dlp overlay and reload yt_dlp in-process with rollback on error."""
+    global PO_TOKEN_PROVIDER_IMPORT_ERROR, PO_TOKEN_PROVIDER_READY
+    previous_root = tool_updater.active_managed_python_root()
+    try:
+        tool_updater.purge_yt_dlp_modules()
+        tool_updater.set_managed_python_overlay(new_root)
+        _import_yt_dlp_symbols()
+        PO_TOKEN_PROVIDER_IMPORT_ERROR = None
+        PO_TOKEN_PROVIDER_READY = None
+        return active_yt_dlp_version()
+    except Exception:
+        tool_updater.purge_yt_dlp_modules()
+        tool_updater.set_managed_python_overlay(previous_root)
+        _import_yt_dlp_symbols()
+        PO_TOKEN_PROVIDER_IMPORT_ERROR = None
+        PO_TOKEN_PROVIDER_READY = None
+        raise
+
+
+try:
+    _import_yt_dlp_symbols()
+except Exception as _bootstrap_error:  # noqa: BLE001
+    if _BOOTSTRAPPED_YT_DLP_ROOT is not None:
+        YT_DLP_BOOTSTRAP_WARNING = (
+            f"Managed yt-dlp overlay failed to load ({_bootstrap_error}); fell back to bundled yt-dlp."
+        )
+        tool_updater.purge_yt_dlp_modules()
+        tool_updater.set_managed_python_overlay(None)
+        _import_yt_dlp_symbols()
+    else:
+        raise
+
 from PySide6.QtCore import QObject, QPoint, QEvent, QThread, Qt, Signal, QTimer
-from PySide6.QtGui import QColor, QFont, QFontDatabase, QIcon, QPainter, QPen, QPixmap, QPolygon, QTextCursor
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QIcon, QPainter, QPen, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QBoxLayout,
@@ -84,7 +156,7 @@ DEFAULT_DOWNLOAD_FORMAT = "bestvideo*+bestaudio/best"
 REQUIRED_PYTHON_PACKAGES = [
     ("yt_dlp", "yt-dlp[default]"),
     ("imageio_ffmpeg", "imageio-ffmpeg"),
-    ("yt_dlp_plugins.extractor.getpot_bgutil_script", "bgutil-ytdlp-pot-provider==1.3.1"),
+    ("yt_dlp_plugins.extractor.getpot_bgutil_script", "bgutil-ytdlp-pot-provider==2.0.2"),
 ]
 HARDWARE_ENCODER_CACHE: dict[str, str | None] = {}
 PO_TOKEN_PROVIDER_IMPORT_ERROR: Exception | None = None
@@ -193,6 +265,62 @@ def format_seconds(total_seconds: float | int | None) -> str:
     if hours:
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
     return f"{minutes:02d}:{secs:02d}"
+
+
+def format_range_filename_tag(start_seconds: int, end_seconds: int) -> str:
+    start_part = format_seconds(start_seconds).replace(":", "-")
+    end_part = format_seconds(end_seconds).replace(":", "-")
+    return f"[{start_part} - {end_part}]"
+
+
+def is_hardware_encoder_failure(
+    error_text: str,
+    ffmpeg_lines: list[str],
+    active_encoder: str | None,
+) -> bool:
+    if not active_encoder:
+        return False
+
+    combined = "\n".join([error_text, *ffmpeg_lines]).lower()
+    hw_markers = (
+        "h264_nvenc",
+        "nvenc",
+        "nvcuda",
+        "cuda_error",
+        "openencodesessionex failed",
+        "incompatible client key",
+        "minimum required nvidia driver",
+        "driver does not support",
+        "no capable devices found",
+        "h264_amf",
+        "amfcreatecomponent",
+        "amf_fail",
+        "h264_qsv",
+        "mfx_err",
+        "error initializing output stream",
+        "error while opening encoder for output stream",
+        "could not open encoder",
+    )
+    if any(marker in combined for marker in hw_markers):
+        return True
+
+    network_or_auth_markers = (
+        "http error",
+        "403 forbidden",
+        "404 not found",
+        "timed out",
+        "connection reset",
+        "winerror",
+        "sign in to confirm",
+        "cookies-from-browser",
+        "ssl:",
+        "certificate verify failed",
+        "could not resolve host",
+    )
+    if any(marker in combined for marker in network_or_auth_markers):
+        return False
+
+    return "ffmpeg exited with code" in combined or "conversion failed" in combined
 
 
 def parse_timecode(value: str) -> int:
@@ -401,18 +529,17 @@ def is_twitch_clip_url(url: str) -> bool:
     return host == "clips.twitch.tv" or (host in {"twitch.tv", "m.twitch.tv"} and "/clip/" in parsed.path)
 
 
+def twitch_downloader_bundled_candidates() -> list[Path]:
+    binary_name = tool_updater.twitch_downloader_binary_name()
+    relative_path = Path("TwitchDownloaderCLI") / binary_name
+    candidates = bundled_relative_candidates(relative_path)
+    if relative_path != TWITCH_DOWNLOADER_RELATIVE_PATH:
+        candidates.extend(bundled_relative_candidates(TWITCH_DOWNLOADER_RELATIVE_PATH))
+    return candidates
+
+
 def resolve_twitch_downloader_executable() -> str | None:
-    for candidate in bundled_relative_candidates(TWITCH_DOWNLOADER_RELATIVE_PATH):
-        if candidate.exists():
-            return str(candidate)
-    return None
-
-
-def user_data_dir() -> Path:
-    appdata = os.getenv("APPDATA")
-    if appdata:
-        return Path(appdata) / "MerchTools" / "Video Downloader"
-    return Path.home() / "AppData" / "Roaming" / "MerchTools" / "Video Downloader"
+    return tool_updater.resolve_twitch_downloader_executable(twitch_downloader_bundled_candidates())
 
 
 def detect_default_browser_cookie_source() -> str | None:
@@ -761,18 +888,6 @@ def configure_ssl_environment() -> None:
     os.environ["CURL_CA_BUNDLE"] = ca_bundle
 
 
-def subprocess_window_options() -> dict:
-    if os.name != "nt":
-        return {}
-
-    startupinfo = subprocess.STARTUPINFO()
-    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-    return {
-        "creationflags": subprocess.CREATE_NO_WINDOW,
-        "startupinfo": startupinfo,
-    }
-
-
 def detect_windows_gpu_names() -> list[str]:
     if os.name != "nt":
         return []
@@ -838,15 +953,6 @@ def detect_hardware_encoder(ffmpeg_path: str) -> str | None:
 
     HARDWARE_ENCODER_CACHE[ffmpeg_path] = encoder
     return encoder
-
-
-def version_key(value: str) -> tuple[int, ...]:
-    parts = [int(part) for part in re.findall(r"\d+", value)]
-    return tuple(parts or [0])
-
-
-def is_newer_version(current_version: str, candidate_version: str) -> bool:
-    return version_key(candidate_version) > version_key(current_version)
 
 
 class WorkerSignals(QObject):
@@ -1275,6 +1381,9 @@ class DownloadWorker(BaseWorker):
         self.ffmpeg_progress_label = "Download progress"
         self.helper_process = None
         self.used_browser_auth = False
+        self.final_output_path: str | None = None
+        self.active_hardware_encoder: str | None = None
+        self.ffmpeg_error_lines: list[str] = []
 
     def cancel(self) -> None:
         if self.cancel_requested:
@@ -1306,6 +1415,8 @@ class DownloadWorker(BaseWorker):
                 self.signals.finished.emit({"cancelled": True})
                 return
 
+            self.active_hardware_encoder = None
+            self.ffmpeg_error_lines.clear()
             try:
                 code = self.run_standard_download()
                 if self.cancel_requested:
@@ -1315,7 +1426,10 @@ class DownloadWorker(BaseWorker):
                 if code == 0:
                     self.log("Download finished.")
                     self.signals.progress.emit(100)
-                    self.signals.finished.emit({"ok": True})
+                    self.signals.finished.emit({
+                        "ok": True,
+                        "output_path": self.final_output_path or self.output_path,
+                    })
                     return
                 last_error = f"Download failed with exit code {code}."
                 self.log(last_error)
@@ -1341,6 +1455,25 @@ class DownloadWorker(BaseWorker):
                 last_error = add_browser_cookie_hint(str(error).strip() or "Download failed.", self.used_browser_auth)
 
             self.log(last_error)
+            if (
+                self.use_hardware_acceleration
+                and self.active_hardware_encoder
+                and is_hardware_encoder_failure(last_error, self.ffmpeg_error_lines, self.active_hardware_encoder)
+                and attempt < 3
+            ):
+                failed_encoder = self.active_hardware_encoder
+                self.log(f"Hardware encoder ({failed_encoder}) failed. Retrying with CPU encoding...")
+                self.use_hardware_acceleration = False
+                self.active_hardware_encoder = None
+                HARDWARE_ENCODER_CACHE[self.ffmpeg_path] = None
+                partial_output = Path(self.output_path)
+                if partial_output.exists():
+                    try:
+                        partial_output.unlink()
+                    except OSError:
+                        pass
+                self.signals.progress.emit(0)
+                continue
             if "WinError 10054" in last_error and "twitch" in self.url.lower() and attempt < 3:
                 self.log(f"Twitch request dropped. Retrying download ({attempt}/2)...")
                 self.signals.progress.emit(0)
@@ -1391,6 +1524,7 @@ class DownloadWorker(BaseWorker):
                     "outtmpl": self.output_template,
                     "force_keyframes_at_cuts": self.start_seconds is not None and self.end_seconds is not None,
                     "progress_hooks": [self.on_progress],
+                    "postprocessor_hooks": [self.on_postprocessor],
                     "logger": YtDlpWorkerLogger(self),
                 }
                 if not self.audio_only_wav:
@@ -1661,9 +1795,23 @@ class DownloadWorker(BaseWorker):
                 line = raw_line.strip()
                 if line:
                     self.on_ffmpeg_output(line)
-            return process.wait()
+            exit_code = process.wait()
         finally:
             self.ffmpeg_process = None
+
+        if exit_code != 0 and not self.cancel_requested and self.use_hardware_acceleration and self.active_hardware_encoder:
+            failed_encoder = self.active_hardware_encoder
+            self.log(f"Hardware encoder ({failed_encoder}) failed. Retrying with CPU encoding...")
+            self.use_hardware_acceleration = False
+            self.active_hardware_encoder = None
+            HARDWARE_ENCODER_CACHE[self.ffmpeg_path] = None
+            if output_path.exists():
+                try:
+                    output_path.unlink()
+                except OSError:
+                    pass
+            return self.trim_local_clip(source_path, output_path)
+        return exit_code
 
     def extract_wav_from_media(
         self,
@@ -1784,6 +1932,7 @@ class DownloadWorker(BaseWorker):
 
     def build_ffmpeg_output_args(self) -> list[str]:
         args = ["-progress", "pipe:2", "-nostats"]
+        self.active_hardware_encoder = None
         if self.audio_only_wav:
             return args
         if self.start_seconds is None or self.end_seconds is None or not self.use_hardware_acceleration:
@@ -1791,12 +1940,15 @@ class DownloadWorker(BaseWorker):
 
         encoder = detect_hardware_encoder(self.ffmpeg_path)
         if encoder == "h264_nvenc":
+            self.active_hardware_encoder = encoder
             self.log("Hardware acceleration: using NVIDIA NVENC for clip encoding.")
             return args + ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "19", "-b:v", "0", "-c:a", "aac", "-b:a", "192k"]
         if encoder == "h264_amf":
+            self.active_hardware_encoder = encoder
             self.log("Hardware acceleration: using AMD AMF for clip encoding.")
             return args + ["-c:v", "h264_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "19", "-qp_p", "21", "-qp_b", "23", "-c:a", "aac", "-b:a", "192k"]
         if encoder == "h264_qsv":
+            self.active_hardware_encoder = encoder
             self.log("Hardware acceleration: using Intel Quick Sync for clip encoding.")
             return args + ["-c:v", "h264_qsv", "-global_quality", "21", "-look_ahead", "0", "-c:a", "aac", "-b:a", "192k"]
 
@@ -1865,6 +2017,9 @@ class DownloadWorker(BaseWorker):
         key, separator, value = line.partition("=")
         key = key.strip()
         if not separator or (key not in progress_keys and not re.fullmatch(r"stream_\d+_\d+_q", key)):
+            if len(self.ffmpeg_error_lines) >= 100:
+                self.ffmpeg_error_lines.pop(0)
+            self.ffmpeg_error_lines.append(line)
             self.log(f"[ffmpeg] {line}")
             return
         value = value.strip()
@@ -1922,12 +2077,24 @@ class DownloadWorker(BaseWorker):
         suffix = f" ({', '.join(details)})" if details else ""
         self.log(f"{self.ffmpeg_progress_label}: {percentage}%{suffix}")
 
+    def on_postprocessor(self, data: dict) -> None:
+        if data.get("status") != "finished":
+            return
+        info_dict = data.get("info_dict")
+        if isinstance(info_dict, dict):
+            filepath = info_dict.get("filepath") or info_dict.get("_filename")
+            if isinstance(filepath, str) and filepath.strip():
+                self.final_output_path = filepath.strip()
+
     def on_progress(self, data: dict) -> None:
         if self.cancel_requested:
             raise KeyboardInterrupt
 
         status = data.get("status")
         if status == "finished":
+            filename = data.get("filename")
+            if isinstance(filename, str) and filename.strip() and not self.final_output_path:
+                self.final_output_path = filename.strip()
             self.signals.progress.emit(100)
             return
 
@@ -2141,6 +2308,46 @@ class InstallerDownloadWorker(BaseWorker):
         return name
 
 
+class ToolUpdateWorker(BaseWorker):
+    def __init__(
+        self,
+        current_yt_dlp_version: str,
+        current_ejs_version: str | None,
+        *,
+        force: bool = False,
+        silent: bool = True,
+    ) -> None:
+        super().__init__()
+        self.current_yt_dlp_version = current_yt_dlp_version
+        self.current_ejs_version = current_ejs_version
+        self.force = force
+        self.silent = silent
+        self.cancel_requested = False
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+
+    def run(self) -> None:
+        try:
+            outcomes = tool_updater.update_all_tools(
+                current_yt_dlp_version=self.current_yt_dlp_version,
+                current_ejs_version=self.current_ejs_version,
+                twitch_bundled_candidates=twitch_downloader_bundled_candidates(),
+                user_agent=f"MerchToolsVideoDownloader/{APP_VERSION}",
+                force=self.force,
+                urlopen_kwargs=urlopen_options(),
+                log=self.log,
+                cancel_check=lambda: self.cancel_requested,
+            )
+            self.signals.finished.emit({
+                "outcomes": outcomes,
+                "force": self.force,
+                "silent": self.silent,
+            })
+        except Exception as error:  # noqa: BLE001
+            self.emit_error(f"Backend update check failed: {error}")
+
+
 class CardFrame(QFrame):
     def __init__(self, title: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -2174,182 +2381,6 @@ class CardFrame(QFrame):
         layout.addLayout(self.content_layout)
 
 
-class CatSpriteLabel(QLabel):
-    clicked = Signal(object)
-
-    def mousePressEvent(self, event) -> None:  # type: ignore[override]
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.clicked.emit(self)
-            event.accept()
-            return
-        super().mousePressEvent(event)
-
-
-class PixelExplosion(QWidget):
-    def __init__(self, parent: QWidget, center: QPoint, color: QColor) -> None:
-        super().__init__(parent)
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setStyleSheet("background: transparent;")
-        self.resize(parent.size())
-        self.particles: list[dict] = []
-        self.life = 18
-        flame_colors = [
-            QColor("#fff1b8"),
-            QColor("#ffd166"),
-            QColor("#ff9f43"),
-            QColor("#ff6b35"),
-            QColor(color),
-        ]
-        smoke_colors = [
-            QColor("#6d625f"),
-            QColor("#4d4542"),
-            QColor("#8b807b"),
-        ]
-        for _ in range(16):
-            self.particles.append({
-                "x": float(center.x() + random.randint(-8, 8)),
-                "y": float(center.y() + random.randint(-8, 8)),
-                "dx": random.uniform(-5.8, 5.8),
-                "dy": random.uniform(-6.8, 2.6),
-                "size": random.randint(6, 12),
-                "color": QColor(random.choice(flame_colors)),
-                "gravity": 0.30,
-                "shrink": 0.42,
-                "kind": "flame",
-            })
-        for _ in range(10):
-            self.particles.append({
-                "x": float(center.x() + random.randint(-5, 5)),
-                "y": float(center.y() + random.randint(-5, 5)),
-                "dx": random.uniform(-2.2, 2.2),
-                "dy": random.uniform(-3.8, -0.6),
-                "size": random.randint(8, 15),
-                "color": QColor(random.choice(smoke_colors)),
-                "gravity": -0.03,
-                "shrink": 0.18,
-                "kind": "smoke",
-            })
-        for _ in range(12):
-            self.particles.append({
-                "x": float(center.x()),
-                "y": float(center.y()),
-                "dx": random.uniform(-7.5, 7.5),
-                "dy": random.uniform(-4.5, 3.5),
-                "size": random.randint(2, 4),
-                "color": QColor("#fff4d1"),
-                "gravity": 0.16,
-                "shrink": 0.08,
-                "kind": "spark",
-            })
-        self.timer = QTimer(self)
-        self.timer.setInterval(32)
-        self.timer.timeout.connect(self.advance_frame)
-        self.show()
-        self.raise_()
-        self.timer.start()
-
-    def advance_frame(self) -> None:
-        self.life -= 1
-        for particle in self.particles:
-            particle["x"] += particle["dx"]
-            particle["y"] += particle["dy"]
-            particle["dy"] += particle["gravity"]
-            particle["size"] = max(1, particle["size"] - particle["shrink"])
-            if particle["kind"] == "smoke":
-                particle["dx"] *= 0.98
-            else:
-                particle["dx"] *= 0.99
-        self.update()
-        if self.life <= 0:
-            self.timer.stop()
-            self.deleteLater()
-
-    def paintEvent(self, event) -> None:  # type: ignore[override]
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-        for particle in self.particles:
-            color = QColor(particle["color"])
-            alpha_scale = 13 if particle["kind"] == "smoke" else 18
-            color.setAlpha(max(18, min(255, self.life * alpha_scale)))
-            painter.fillRect(
-                int(particle["x"]),
-                int(particle["y"]),
-                int(particle["size"]),
-                int(particle["size"]),
-                color,
-            )
-
-
-class IndustrialCursorOverlay(QWidget):
-    def __init__(self, parent: QWidget) -> None:
-        super().__init__(parent)
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.target = QPoint(parent.width() // 2, parent.height() // 2)
-        self.ring = QPoint(self.target)
-        self.hover = False
-        self.visible_cursor = True
-        self.resize(parent.size())
-        self.timer = QTimer(self)
-        self.timer.setInterval(16)
-        self.timer.timeout.connect(self.animate)
-        self.timer.start()
-        self.show()
-
-    def set_target(self, position: QPoint) -> None:
-        self.target = position
-        self.visible_cursor = True
-        self.update()
-
-    def set_hover(self, hovered: bool) -> None:
-        if self.hover == hovered:
-            return
-        self.hover = hovered
-        self.update()
-
-    def animate(self) -> None:
-        dx = self.target.x() - self.ring.x()
-        dy = self.target.y() - self.ring.y()
-        if abs(dx) < 1 and abs(dy) < 1:
-            self.raise_()
-            return
-        self.ring.setX(int(self.ring.x() + dx * 0.18))
-        self.ring.setY(int(self.ring.y() + dy * 0.18))
-        self.raise_()
-        self.update()
-
-    def paintEvent(self, event) -> None:  # type: ignore[override]
-        if not self.visible_cursor:
-            return
-
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-
-        ring_radius = 14 if not self.hover else 7
-        ring_color = QColor(192, 255, 51, 76)
-        if not self.hover:
-            painter.setPen(QPen(ring_color, 1))
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawEllipse(self.ring, ring_radius, ring_radius)
-
-        dot_size = 5 if not self.hover else 16
-        dot_rect = (
-            self.target.x() - dot_size // 2,
-            self.target.y() - dot_size // 2,
-            dot_size,
-            dot_size,
-        )
-        if self.hover:
-            painter.setPen(QPen(QColor("#c0ff33"), 1))
-            painter.setBrush(QColor(192, 255, 51, 45))
-            painter.drawEllipse(*dot_rect)
-        else:
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor("#c0ff33"))
-            painter.drawEllipse(*dot_rect)
-
-
 class WindowTitleBar(QFrame):
     def __init__(self, window: "MainWindow") -> None:
         super().__init__(window)
@@ -2360,12 +2391,6 @@ class WindowTitleBar(QFrame):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(20, 0, 0, 0)
         layout.setSpacing(12)
-
-        self.toggle_button = QPushButton("▲")
-        self.toggle_button.setObjectName("titleBarToggle")
-        self.toggle_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.toggle_button.clicked.connect(self.window.toggle_kittycat_menu)
-        layout.addWidget(self.toggle_button, 0, Qt.AlignmentFlag.AlignVCenter)
 
         brand = QLabel("MERCHTOOLS")
         brand.setObjectName("titleBarBrand")
@@ -2417,9 +2442,6 @@ class WindowTitleBar(QFrame):
         self.maximize_button.setText("❐" if maximized else "□")
         self.maximize_button.setToolTip("Windowed" if maximized else "Full screen")
 
-    def set_menu_expanded(self, expanded: bool) -> None:
-        self.toggle_button.setText("▼" if expanded else "▲")
-
     def mouseDoubleClickEvent(self, event) -> None:  # type: ignore[override]
         super().mouseDoubleClickEvent(event)
 
@@ -2461,6 +2483,7 @@ class MainWindow(QMainWindow):
         self.is_downloading = False
         self.is_checking_updates = False
         self.is_installing_update = False
+        self.is_checking_tool_updates = False
         self.video_duration: int | None = None
         self.video_title = ""
         self.last_auto_filename = ""
@@ -2469,11 +2492,15 @@ class MainWindow(QMainWindow):
         self.active_worker: BaseWorker | None = None
         self.update_thread: QThread | None = None
         self.update_worker: BaseWorker | None = None
+        self.tool_update_thread: QThread | None = None
+        self.tool_update_worker: ToolUpdateWorker | None = None
+        self._pending_yt_dlp_reload = False
+        self._pending_yt_dlp_root: Path | None = None
+        self._pending_yt_dlp_version = ""
+        self._start_time_autofilled = False
         self.update_info: dict | None = None
         self.update_config = load_update_config()
         self.user_settings = load_user_settings()
-        self.cat_mode_enabled = bool(self.user_settings.get("cat_mode"))
-        self.classic_ui_enabled = bool(self.user_settings.get("classic_ui"))
         self.audio_only_wav_enabled = bool(self.user_settings.get("audio_only_wav"))
         self.last_fetched_url = ""
         self.last_output_path: Path | None = None
@@ -2485,15 +2512,9 @@ class MainWindow(QMainWindow):
         self.ui_scale = 1.0
         self.root_widget: QWidget | None = None
         self.title_bar: WindowTitleBar | None = None
-        self.kittycat_menu: QFrame | None = None
         self.activity_indicator_effect: QGraphicsOpacityEffect | None = None
         self.activity_indicator_visible = True
         self.resize_edges = Qt.Edge(0)
-        self.cat_sprites: list[dict] = []
-        self.kittycat_sound_path = self.prepare_kittycat_sound()
-        self.cat_timer = QTimer(self)
-        self.cat_timer.setInterval(40)
-        self.cat_timer.timeout.connect(self.tick_cat_sprites)
         self.url_fetch_timer = QTimer(self)
         self.url_fetch_timer.setInterval(1100)
         self.url_fetch_timer.setSingleShot(True)
@@ -2502,14 +2523,16 @@ class MainWindow(QMainWindow):
         self.activity_timer.setInterval(380)
         self.activity_timer.timeout.connect(self.tick_activity_indicator)
         self.setFont(QFont("IBM Plex Sans Var", 11))
-        self.setStyleSheet(self.build_stylesheet(self.cat_mode_enabled, self.layout_mode, self.classic_ui_enabled, self.ui_scale))
+        self.setStyleSheet(self.build_stylesheet(self.layout_mode, self.ui_scale))
         self.build_ui()
         self.update_responsive_layout(force=True)
         self.enable_native_cursor()
-        self.apply_cat_mode(self.cat_mode_enabled)
         self.update_button_state()
         self.refresh_update_button()
         self.append_log(f"App version: {APP_VERSION}")
+        self.write_raw_log(f"Active yt-dlp version: {active_yt_dlp_version()}")
+        if YT_DLP_BOOTSTRAP_WARNING:
+            self.append_log(YT_DLP_BOOTSTRAP_WARNING)
         self.append_log("Ready. Paste a video link, choose full range or enter a clip range, then download.")
         self.start_dependency_check()
 
@@ -2575,7 +2598,7 @@ class MainWindow(QMainWindow):
 
         self.check_updates_button = QPushButton("Check for updates")
         self.check_updates_button.setObjectName("versionPillButton")
-        self.check_updates_button.clicked.connect(self.check_for_updates)
+        self.check_updates_button.clicked.connect(lambda: self.check_for_updates(silent=False))
         self.check_updates_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.header_action_layout.addWidget(self.check_updates_button, 0, Qt.AlignmentFlag.AlignVCenter)
 
@@ -2662,12 +2685,14 @@ class MainWindow(QMainWindow):
         self.start_input.setMinimumHeight(54)
         self.start_input.setMaximumHeight(54)
         self.start_input.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.start_input.textEdited.connect(self.on_start_time_edited)
         self.end_input = QLineEdit()
         self.end_input.setObjectName("timeInput")
         self.end_input.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
         self.end_input.setMinimumHeight(54)
         self.end_input.setMaximumHeight(54)
         self.end_input.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.end_input.textChanged.connect(self.on_end_time_changed)
         self.update_clip_range_placeholders()
 
         self.clip_fields_row = QWidget()
@@ -2770,54 +2795,6 @@ class MainWindow(QMainWindow):
         self.download_section_layout.addWidget(self.download_button)
         right_layout.addWidget(self.download_section)
 
-        self.build_kittycat_menu()
-
-    def build_kittycat_menu(self) -> None:
-        self.kittycat_menu = QFrame(self)
-        self.kittycat_menu.setObjectName("kittycatMenu")
-        self.kittycat_menu.hide()
-        layout = QVBoxLayout(self.kittycat_menu)
-        layout.setContentsMargins(18, 16, 18, 16)
-        layout.setSpacing(12)
-
-        menu_label = QLabel("Secret Menu")
-        menu_label.setObjectName("kittycatMenuTitle")
-        layout.addWidget(menu_label)
-
-        self.cat_checkbox = IndustrialCheckBox("Kittycat")
-        self.cat_checkbox.setObjectName("optionToggle")
-        self.cat_checkbox.setChecked(self.cat_mode_enabled)
-        self.cat_checkbox.toggled.connect(self.on_cat_mode_toggled)
-        layout.addWidget(self.cat_checkbox)
-
-        self.classic_ui_checkbox = IndustrialCheckBox("Classic UI (1.0.7)")
-        self.classic_ui_checkbox.setObjectName("optionToggle")
-        self.classic_ui_checkbox.setChecked(self.classic_ui_enabled)
-        self.classic_ui_checkbox.toggled.connect(self.on_classic_ui_toggled)
-        layout.addWidget(self.classic_ui_checkbox)
-
-        self.position_kittycat_menu()
-
-    def position_kittycat_menu(self) -> None:
-        if self.kittycat_menu is None or self.title_bar is None:
-            return
-        self.kittycat_menu.adjustSize()
-        toggle = getattr(self.title_bar, "toggle_button", None)
-        x = 14
-        if toggle is not None:
-            x = max(12, toggle.mapTo(self, QPoint(0, 0)).x() - 4)
-        y = self.title_bar.height() + 8
-        self.kittycat_menu.move(x, y)
-
-    def toggle_kittycat_menu(self) -> None:
-        if self.kittycat_menu is None or self.title_bar is None:
-            return
-        visible = not self.kittycat_menu.isVisible()
-        self.kittycat_menu.setVisible(visible)
-        self.kittycat_menu.raise_()
-        self.position_kittycat_menu()
-        self.title_bar.set_menu_expanded(visible)
-
     def create_form_row(self, label: QLabel, content: QWidget) -> tuple[QWidget, QBoxLayout]:
         row = QWidget()
         layout = QBoxLayout(QBoxLayout.Direction.LeftToRight, row)
@@ -2858,7 +2835,7 @@ class MainWindow(QMainWindow):
         if force or mode != self.layout_mode or abs(scale - self.ui_scale) >= 0.015:
             self.layout_mode = mode
             self.ui_scale = scale
-            self.setStyleSheet(self.build_stylesheet(self.cat_mode_enabled, self.layout_mode, self.classic_ui_enabled, self.ui_scale))
+            self.setStyleSheet(self.build_stylesheet(self.layout_mode, self.ui_scale))
 
         def sp(value: int) -> int:
             return max(1, int(round(value * self.ui_scale)))
@@ -2868,39 +2845,29 @@ class MainWindow(QMainWindow):
             self.title_bar.setFixedHeight(title_bar_height)
             self.title_bar.sync_window_controls()
 
-        if self.classic_ui_enabled:
-            self.header_layout.setContentsMargins(sp(20), sp(8), sp(20), sp(8))
-        else:
-            self.header_layout.setContentsMargins(sp(40), sp(24), sp(40), sp(18))
+        self.header_layout.setContentsMargins(sp(40), sp(24), sp(40), sp(18))
         self.header_top_layout.setDirection(QBoxLayout.Direction.TopToBottom if stack_header else QBoxLayout.Direction.LeftToRight)
-        self.header_top_layout.setSpacing(sp(10 if self.classic_ui_enabled else (18 if stack_header else 22)))
+        self.header_top_layout.setSpacing(sp(18 if stack_header else 22))
         self.header_top_layout.setAlignment(self.header_action_panel, Qt.AlignmentFlag.AlignLeft if stack_header else Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight)
         self.header_action_layout.setDirection(QBoxLayout.Direction.LeftToRight)
-        self.header_action_layout.setSpacing(sp(12 if self.classic_ui_enabled else 14))
+        self.header_action_layout.setSpacing(sp(14))
 
         self.main_content_layout.setDirection(QBoxLayout.Direction.LeftToRight)
         self.main_content_layout.setStretch(0, 9)
         self.main_content_layout.setStretch(1, 0)
         self.main_content_layout.setStretch(2, 4)
-        self.right_panel.setMinimumWidth(sp(340 if self.classic_ui_enabled else 360))
-        self.right_panel.setMaximumWidth(sp(430 if self.classic_ui_enabled else 470))
+        self.right_panel.setMinimumWidth(sp(360))
+        self.right_panel.setMaximumWidth(sp(470))
         if self.right_panel.property("stacked") != stack_panels:
             self.right_panel.setProperty("stacked", stack_panels)
             self.right_panel.style().unpolish(self.right_panel)
             self.right_panel.style().polish(self.right_panel)
 
-        if self.classic_ui_enabled:
-            self.left_column.setContentsMargins(sp(20), sp(20), sp(12), sp(20))
-            self.left_column.setSpacing(sp(16))
-            self.activity_header_layout.setContentsMargins(sp(22), sp(18), sp(22), sp(10))
-            self.activity_body_layout.setContentsMargins(sp(22), sp(8), sp(22), sp(12))
-            self.download_section_layout.setContentsMargins(sp(22), sp(12), sp(22), sp(22))
-        else:
-            self.left_column.setContentsMargins(sp(20), sp(10), sp(16), sp(16))
-            self.left_column.setSpacing(sp(14))
-            self.activity_header_layout.setContentsMargins(sp(28), sp(18), sp(28), sp(14))
-            self.activity_body_layout.setContentsMargins(sp(28), sp(22), sp(28), sp(20))
-            self.download_section_layout.setContentsMargins(sp(28), sp(22), sp(28), sp(24))
+        self.left_column.setContentsMargins(sp(20), sp(10), sp(16), sp(16))
+        self.left_column.setSpacing(sp(14))
+        self.activity_header_layout.setContentsMargins(sp(28), sp(18), sp(28), sp(14))
+        self.activity_body_layout.setContentsMargins(sp(28), sp(22), sp(28), sp(20))
+        self.download_section_layout.setContentsMargins(sp(28), sp(22), sp(28), sp(24))
 
         self.video_url_row_layout.setDirection(QBoxLayout.Direction.LeftToRight)
         self.video_url_row_layout.setSpacing(sp(22))
@@ -2992,11 +2959,6 @@ class MainWindow(QMainWindow):
                 if self.update_resize_state(position):
                     return False
             elif event.type() == QEvent.Type.MouseButtonPress:
-                if self.kittycat_menu is not None and self.kittycat_menu.isVisible():
-                    if watched not in {self.kittycat_menu, self.title_bar, getattr(self.title_bar, "toggle_button", None), self.cat_checkbox} and not self.kittycat_menu.isAncestorOf(watched):
-                        self.kittycat_menu.hide()
-                        if self.title_bar is not None:
-                            self.title_bar.set_menu_expanded(False)
                 is_titlebar_widget = (
                     self.title_bar is not None
                     and isinstance(watched, QWidget)
@@ -3076,9 +3038,7 @@ class MainWindow(QMainWindow):
 
     def build_stylesheet(
         self,
-        cat_mode: bool = False,
         layout_mode: str = "default",
-        classic_ui: bool = False,
         scale: float = 1.0,
     ) -> str:
         def sp(value: int) -> int:
@@ -3088,7 +3048,6 @@ class MainWindow(QMainWindow):
         body_font_family = "\"IBM Plex Sans Var\", \"IBM Plex Sans\""
         mono_font_family = "\"IBM Plex Mono\", \"DM Mono\""
 
-        main_background = "#090909"
         window_background = "#0d0d0d"
         card_border = "#1e1e1e"
         card_background = "#111111"
@@ -3102,7 +3061,6 @@ class MainWindow(QMainWindow):
         dim_text = "#4a4a4a"
         accent = "#c0ff33"
         accent_soft = "rgba(192, 255, 51, 0.10)"
-        title_bar_icon_size = smax(22, 18)
         title_bar_brand_size = smax(12, 11)
         title_bar_title_size = smax(13, 12)
         hero_title_size = smax(44, 34)
@@ -3121,36 +3079,6 @@ class MainWindow(QMainWindow):
         checkbox_size = smax(13, 12)
         button_text_size = smax(12, 11)
 
-        if classic_ui:
-            main_background = "#131516"
-            window_background = "#131516"
-            card_border = "#2a2e33"
-            card_background = "transparent"
-            input_background = "#171a1d"
-            primary_input_background = "#1b1f23"
-            primary_input_border = "#3a4148"
-            button_background = "#1b1f23"
-            button_hover = "#23282d"
-            accent = "#ff9a55"
-            accent_soft = "rgba(255, 154, 85, 0.10)"
-            text_color = "#efe8dd"
-            muted_text = "#cbbda8"
-            dim_text = "#7d766d"
-            title_bar_brand_size = sp(11)
-            title_bar_title_size = sp(12)
-            hero_title_size = smax(32, 26)
-            version_size = smax(12, 11)
-            version_button_size = smax(12, 11)
-            card_title_size = smax(20, 18)
-            field_label_size = smax(13, 12)
-            body_text_size = smax(12, 11)
-            input_text_size = smax(14, 12)
-            time_input_size = smax(13, 12)
-            activity_title_size = smax(18, 16)
-            log_text_size = smax(13, 11)
-            checkbox_size = smax(14, 12)
-            button_text_size = smax(12, 11)
-
         return f"""
         QWidget#appRoot {{
             background: {window_background};
@@ -3165,41 +3093,25 @@ class MainWindow(QMainWindow):
             background: {window_background};
         }}
         QFrame#titleBar {{
-            background: {"#131516" if classic_ui else "#090909"};
-            border-bottom: {"none" if classic_ui else "1px solid #1e1e1e"};
-        }}
-        QPushButton#titleBarToggle {{
-            font-family: {mono_font_family};
-            background: transparent;
-            color: {accent};
-            font-size: {title_bar_icon_size}px;
-            padding: 0px;
-            min-width: {sp(22)}px;
-            min-height: {sp(22)}px;
-            border: none;
-            letter-spacing: 0;
-        }}
-        QPushButton#titleBarToggle:hover {{
-            color: {text_color};
-            background: transparent;
-            border: none;
+            background: #090909;
+            border-bottom: 1px solid #1e1e1e;
         }}
         QLabel#titleBarBrand {{
-            font-family: {(mono_font_family if not classic_ui else "\"Segoe UI\"")};
+            font-family: {mono_font_family};
             color: {dim_text};
             font-size: {title_bar_brand_size}px;
-            letter-spacing: {("0.24em" if not classic_ui else "0.08em")};
+            letter-spacing: 0.24em;
         }}
         QFrame#titleBarSeparator {{
             background: #242424;
             border: none;
         }}
         QLabel#titleBarTitle {{
-            font-family: {(body_font_family if not classic_ui else "\"Segoe UI\"")};
+            font-family: {body_font_family};
             color: {text_color};
             font-size: {title_bar_title_size}px;
-            font-weight: {500 if not classic_ui else 500};
-            letter-spacing: {("0.04em" if not classic_ui else "0.04em")};
+            font-weight: 500;
+            letter-spacing: 0.04em;
         }}
         QPushButton#titleBarButton, QPushButton#titleBarCloseButton {{
             font-family: {mono_font_family};
@@ -3218,113 +3130,101 @@ class MainWindow(QMainWindow):
             font-size: {sp(24)}px;
         }}
         QPushButton#titleBarButton:hover {{
-            background: {"transparent" if classic_ui else "#161616"};
+            background: #161616;
             color: {text_color};
         }}
         QPushButton#titleBarCloseButton:hover {{
-            background: {"transparent" if classic_ui else "#2a1010"};
-            color: {"#efe8dd" if classic_ui else "#ff4444"};
+            background: #2a1010;
+            color: #ff4444;
         }}
         QFrame#appHeader {{
             background: {window_background};
-            border-bottom: {"none" if classic_ui else "1px solid #1e1e1e"};
-        }}
-        QFrame#kittycatMenu {{
-            background: {"#1b1f23" if classic_ui else "#111111"};
-            border: 1px solid {"#2a2e33" if classic_ui else "#1e1e1e"};
-            border-radius: {sp(12) if classic_ui else 0}px;
+            border-bottom: 1px solid #1e1e1e;
         }}
         QFrame#activityDivider {{
-            background: {"#2a2e33" if classic_ui else "#1e1e1e"};
+            background: #1e1e1e;
             border: none;
-        }}
-        QLabel#kittycatMenuTitle {{
-            font-family: {"\"Segoe UI\"" if classic_ui else mono_font_family};
-            color: {muted_text};
-            font-size: 11px;
-            letter-spacing: {("0em" if classic_ui else "0.22em")};
-            text-transform: {("none" if classic_ui else "uppercase")};
         }}
         QFrame#card {{
             background: {card_background};
             border: 1px solid {card_border};
-            border-radius: {sp(20) if classic_ui else 0}px;
+            border-radius: 0px;
         }}
         QFrame#cardAccentLine {{
-            background: {"transparent" if classic_ui else "transparent"};
+            background: transparent;
             border: none;
             max-height: 1px;
         }}
         QFrame#cardTitleDot {{
-            background: {"transparent" if classic_ui else accent};
+            background: {accent};
             border: none;
             border-radius: 3px;
         }}
         QLabel#eyebrow {{
             color: {muted_text};
-            font-family: {(mono_font_family if not classic_ui else "\"Segoe UI\"")};
+            font-family: {mono_font_family};
             font-size: {eyebrow_size}px;
             font-weight: 600;
-            letter-spacing: {("0.30em" if not classic_ui else "0.08em")};
+            letter-spacing: 0.30em;
             text-transform: uppercase;
         }}
         QLabel#eyebrowAccent {{
-            color: {"transparent" if classic_ui else accent};
+            color: {accent};
             font-family: {mono_font_family};
             font-size: {eyebrow_accent_size}px;
             font-weight: 500;
             letter-spacing: 0.22em;
         }}
         QLabel#heroTitle {{
-            font-family: {"\"Syne\"" if not classic_ui else "\"Trebuchet MS\""};
+            font-family: "Syne";
             font-size: {hero_title_size}px;
-            font-weight: {800 if not classic_ui else 700};
-            letter-spacing: {("-0.02em" if not classic_ui else "0em")};
+            font-weight: 800;
+            letter-spacing: -0.02em;
         }}
         QLabel#versionPill {{
-            font-family: {"\"Segoe UI\"" if classic_ui else mono_font_family};
+            font-family: {mono_font_family};
             color: {dim_text};
             font-size: {version_size}px;
-            font-weight: {700 if classic_ui else 500};
+            font-weight: 500;
             padding: 0px;
-            letter-spacing: {("0em" if classic_ui else "0.18em")};
-            text-transform: {("none" if classic_ui else "uppercase")};
+            letter-spacing: 0.18em;
+            text-transform: uppercase;
         }}
         QPushButton#versionPillButton {{
-            font-family: {(body_font_family if not classic_ui else "\"Segoe UI\"")};
+            font-family: {body_font_family};
             background: transparent;
             color: {muted_text};
             font-size: {version_button_size}px;
-            font-weight: {500 if not classic_ui else 700};
-            letter-spacing: {("0.12em" if not classic_ui else "0em")};
-            text-transform: {("uppercase" if not classic_ui else "none")};
-            padding: {("0px" if classic_ui else f"{sp(10)}px {sp(18)}px")};
-            border: {("1px solid #2e2e2e" if not classic_ui else "none")};
-            border-radius: {0 if not classic_ui else 0}px;
+            font-weight: 500;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            padding: {sp(10)}px {sp(18)}px;
+            border: 1px solid #2e2e2e;
+            border-radius: 0px;
         }}
         QPushButton#versionPillButton:hover {{
-            color: {text_color if classic_ui else accent};
+            color: {accent};
             border-color: {accent};
-            background: {("transparent" if classic_ui else accent_soft)};
+            background: {accent_soft};
         }}
         QPushButton#versionPillButton:disabled {{
             background: transparent;
             color: {dim_text};
-            border-color: {("#1e1e1e" if not classic_ui else "transparent")};
+            border-color: #1e1e1e;
         }}
         QLabel#hintText, QLabel#metaText {{
-            font-family: {(body_font_family if not classic_ui else "\"Segoe UI\"")};
+            font-family: {body_font_family};
             color: {muted_text};
-            line-height: {("1.4" if classic_ui else "1.7")};
+            line-height: 1.7;
             font-size: {body_text_size}px;
-            letter-spacing: {("0em" if classic_ui else "0.01em")};
+            letter-spacing: 0.01em;
         }}
         QCheckBox#optionToggle {{
-            font-family: {(body_font_family if not classic_ui else "\"Segoe UI\"")};
+            font-family: {body_font_family};
             color: {text_color};
             spacing: 12px;
             font-size: {checkbox_size}px;
-            letter-spacing: {("0em" if classic_ui else "0.02em")};
+            letter-spacing: 0.02em;
             padding: 2px 0px;
             background: transparent;
             border: none;
@@ -3333,35 +3233,35 @@ class MainWindow(QMainWindow):
             color: {text_color};
         }}
         QCheckBox#optionToggle::indicator {{
-            width: {sp(18 if classic_ui else 14)}px;
-            height: {sp(18 if classic_ui else 14)}px;
-            border-radius: {sp(5) if classic_ui else 0}px;
-            border: 1px solid {"#3a4148" if classic_ui else "#333333"};
-            background: {"#171a1d" if classic_ui else "#090909"};
+            width: {sp(14)}px;
+            height: {sp(14)}px;
+            border-radius: 0px;
+            border: 1px solid #333333;
+            background: #090909;
         }}
         QCheckBox#optionToggle::indicator:checked {{
-            background: {accent if classic_ui else accent_soft};
+            background: {accent_soft};
             border: 1px solid {accent};
         }}
         QLabel#cardTitle {{
             color: {text_color};
-            font-family: {"\"Trebuchet MS\"" if classic_ui else "\"Syne\""};
+            font-family: "Syne";
             font-size: {card_title_size}px;
-            font-weight: {700 if classic_ui else 800};
-            letter-spacing: {("0em" if classic_ui else "-0.01em")};
+            font-weight: 800;
+            letter-spacing: -0.01em;
         }}
         QLabel#fieldLabel {{
-            font-family: {(mono_font_family if not classic_ui else "\"Segoe UI\"")};
+            font-family: {mono_font_family};
             color: {muted_text};
             font-size: {field_label_size}px;
             font-weight: 600;
-            letter-spacing: {("0.24em" if not classic_ui else "0.04em")};
+            letter-spacing: 0.24em;
         }}
         QLineEdit, QTextEdit {{
-            font-family: {(body_font_family if not classic_ui else "\"Segoe UI\"")};
+            font-family: {body_font_family};
             background: {input_background};
             border: 1px solid #242424;
-            border-radius: {12 if classic_ui else 0}px;
+            border-radius: 0px;
             color: {text_color};
             selection-background-color: {accent};
             selection-color: #090909;
@@ -3374,16 +3274,16 @@ class MainWindow(QMainWindow):
         }}
         QLineEdit#primaryInput {{
             font-size: {input_text_size}px;
-            font-weight: {400 if not classic_ui else 600};
-            min-height: {sp(46 if not classic_ui else 38)}px;
+            font-weight: 400;
+            min-height: {sp(46)}px;
             background: {primary_input_background};
             border: 1px solid {primary_input_border};
-            letter-spacing: {("0.02em" if not classic_ui else "0em")};
+            letter-spacing: 0.02em;
         }}
         QLineEdit#timeInput {{
-            min-height: {sp(46 if not classic_ui else 36)}px;
+            min-height: {sp(46)}px;
             font-size: {time_input_size}px;
-            letter-spacing: {("0.02em" if not classic_ui else "0em")};
+            letter-spacing: 0.02em;
         }}
         QLineEdit:disabled {{
             background: #101214;
@@ -3394,21 +3294,21 @@ class MainWindow(QMainWindow):
             border: 1px solid {accent};
         }}
         QPushButton {{
-            font-family: {(body_font_family if not classic_ui else "\"Segoe UI\"")};
+            font-family: {body_font_family};
             background: {button_background};
-            color: {text_color if classic_ui else muted_text};
+            color: {muted_text};
             border: 1px solid #2e2e2e;
-            border-radius: {12 if classic_ui else 0}px;
+            border-radius: 0px;
             padding: {sp(8)}px {sp(16)}px;
             font-size: {button_text_size}px;
             font-weight: 600;
-            letter-spacing: {("0.10em" if not classic_ui else "0em")};
-            text-transform: {("uppercase" if not classic_ui else "none")};
+            letter-spacing: 0.10em;
+            text-transform: uppercase;
         }}
         QPushButton:hover {{
             background: {button_hover};
-            color: {text_color if classic_ui else accent};
-            border-color: {accent if not classic_ui else "#2e2e2e"};
+            color: {accent};
+            border-color: {accent};
         }}
         QPushButton:disabled {{
             background: #171a1d;
@@ -3416,52 +3316,52 @@ class MainWindow(QMainWindow):
             border-color: #22262a;
         }}
         QPushButton#accentButton {{
-            font-size: {sp(12 if not classic_ui else 14)}px;
+            font-size: {sp(12)}px;
             font-weight: 700;
-            padding: {f"{sp(18)}px {sp(18)}px" if not classic_ui else f"{sp(13)}px {sp(18)}px"};
-            background: {accent_soft if not classic_ui else button_background};
-            color: {accent if not classic_ui else text_color};
-            border: 1px solid {accent if not classic_ui else card_border};
+            padding: {sp(18)}px {sp(18)}px;
+            background: {accent_soft};
+            color: {accent};
+            border: 1px solid {accent};
         }}
         QFrame#activityPanel {{
-            background: {"transparent" if classic_ui else "#0d0d0d"};
+            background: #0d0d0d;
             border-left: none;
-            border: {"1px solid #2a2e33" if classic_ui else "none"};
-            border-radius: {"20px" if classic_ui else "0px"};
+            border: none;
+            border-radius: 0px;
         }}
         QFrame#activityPanel[stacked="true"] {{
             border-left: none;
             border-top: 1px solid #1e1e1e;
         }}
         QFrame#activityHeader {{
-            background: {"transparent" if classic_ui else "#0d0d0d"};
-            border-bottom: {"none" if classic_ui else "1px solid #1e1e1e"};
+            background: #0d0d0d;
+            border-bottom: 1px solid #1e1e1e;
         }}
         QFrame#activityBody {{
-            background: {"transparent" if classic_ui else "#090909"};
-            border-bottom: {"none" if classic_ui else "1px solid #1e1e1e"};
+            background: #090909;
+            border-bottom: 1px solid #1e1e1e;
         }}
         QFrame#downloadSection {{
-            background: {"transparent" if classic_ui else "#0d0d0d"};
+            background: #0d0d0d;
         }}
         QFrame#activityIndicator {{
-            background: {"transparent" if classic_ui else accent};
+            background: {accent};
             border-radius: {sp(5)}px;
         }}
         QLabel#activityTitle {{
-            font-family: {"\"Trebuchet MS\"" if classic_ui else "\"Syne\""};
+            font-family: "Syne";
             color: {text_color};
             font-size: {activity_title_size}px;
-            font-weight: {700 if classic_ui else 700};
+            font-weight: 700;
         }}
         QPushButton#activityClearButton {{
-            font-family: {(body_font_family if not classic_ui else "\"Segoe UI\"")};
+            font-family: {body_font_family};
             background: transparent;
             border: none;
             color: {dim_text};
             font-size: {sp(10)}px;
-            letter-spacing: {("0em" if classic_ui else "0.12em")};
-            text-transform: {("none" if classic_ui else "uppercase")};
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
             padding: 0px;
         }}
         QPushButton#activityClearButton:hover {{
@@ -3470,8 +3370,8 @@ class MainWindow(QMainWindow):
             border: none;
         }}
         QTextEdit#logOutput {{
-            font-family: {"\"Consolas\"" if classic_ui else mono_font_family};
-            background: {"transparent" if classic_ui else "#090909"};
+            font-family: {mono_font_family};
+            background: #090909;
             border: none;
             color: {muted_text};
             font-size: {log_text_size}px;
@@ -3483,326 +3383,6 @@ class MainWindow(QMainWindow):
             font-size: {activity_cursor_size}px;
         }}
         """
-
-    def on_cat_mode_toggled(self, checked: bool) -> None:
-        self.apply_cat_mode(checked)
-        self.persist_user_settings()
-
-    def on_classic_ui_toggled(self, checked: bool) -> None:
-        self.classic_ui_enabled = checked
-        self.setStyleSheet(self.build_stylesheet(self.cat_mode_enabled, self.layout_mode, self.classic_ui_enabled, self.ui_scale))
-        self.update_responsive_layout(force=True)
-        self.persist_user_settings()
-        self.position_kittycat_menu()
-
-    def apply_cat_mode(self, enabled: bool) -> None:
-        self.cat_mode_enabled = enabled
-        if enabled:
-            self.create_cat_sprites()
-            self.cat_timer.start()
-            self.append_log("Cat mode enabled.")
-        else:
-            self.cat_timer.stop()
-            self.remove_cat_sprites()
-            self.append_log("Cat mode disabled.")
-
-    def prepare_kittycat_sound(self) -> Path | None:
-        if winsound is None:
-            return None
-        try:
-            sound_dir = user_data_dir() / "sounds"
-            sound_dir.mkdir(parents=True, exist_ok=True)
-            sound_path = sound_dir / "kittycat-pop.wav"
-            if sound_path.exists():
-                return sound_path
-
-            sample_rate = 22050
-            duration = 0.42
-            frame_count = int(sample_rate * duration)
-            frames = bytearray()
-            for index in range(frame_count):
-                t = index / sample_rate
-                envelope = math.exp(-7.5 * t)
-                pop = math.sin(2 * math.pi * (92 + 40 * t) * t) * envelope * 0.16
-                crackle = math.sin(2 * math.pi * 180 * t) * math.exp(-18 * t) * 0.05
-                meow_delay = max(0.0, t - 0.08)
-                meow = math.sin(2 * math.pi * (720 - 260 * meow_delay) * meow_delay) * math.exp(-5.6 * meow_delay) * 0.11
-                sample = max(-1.0, min(1.0, pop + crackle + meow))
-                frames.extend(struct.pack("<h", int(sample * 32767)))
-
-            with wave.open(str(sound_path), "wb") as wav_file:
-                wav_file.setnchannels(1)
-                wav_file.setsampwidth(2)
-                wav_file.setframerate(sample_rate)
-                wav_file.writeframes(bytes(frames))
-            return sound_path
-        except OSError:
-            return None
-
-    def play_kittycat_sound(self) -> None:
-        if winsound is None or self.kittycat_sound_path is None:
-            return
-        try:
-            winsound.PlaySound(
-                str(self.kittycat_sound_path),
-                winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT,
-            )
-        except RuntimeError:
-            return
-
-    def choose_cat_variant(self) -> dict:
-        return random.choice([
-            {
-                "fur": QColor("#f3cfb1"),
-                "outline": QColor("#5b4039"),
-                "ears": QColor("#f6b7ba"),
-                "eyes": QColor("#302624"),
-                "blush": QColor("#f2a5a3"),
-                "face_scale": 0.64,
-                "ear_height": 0.08,
-                "cheek_fluff": 0.0,
-            },
-            {
-                "fur": QColor("#d7d2cb"),
-                "outline": QColor("#4d4d57"),
-                "ears": QColor("#f3c2d3"),
-                "eyes": QColor("#23252c"),
-                "blush": QColor("#dfb0bf"),
-                "face_scale": 0.68,
-                "ear_height": 0.06,
-                "cheek_fluff": 0.03,
-            },
-            {
-                "fur": QColor("#232020"),
-                "outline": QColor("#c5b4ae"),
-                "ears": QColor("#c89198"),
-                "eyes": QColor("#f2efe8"),
-                "blush": QColor("#9c6e74"),
-                "face_scale": 0.62,
-                "ear_height": 0.10,
-                "cheek_fluff": 0.01,
-            },
-            {
-                "fur": QColor("#f0c79d"),
-                "outline": QColor("#8a5f43"),
-                "ears": QColor("#f2aab0"),
-                "eyes": QColor("#4b311d"),
-                "blush": QColor("#ef9e92"),
-                "face_scale": 0.60,
-                "ear_height": 0.09,
-                "cheek_fluff": 0.04,
-            },
-            {
-                "fur": QColor("#e9dfcf"),
-                "outline": QColor("#6c645e"),
-                "ears": QColor("#f4c2c7"),
-                "eyes": QColor("#2d2926"),
-                "blush": QColor("#e8b1ab"),
-                "face_scale": 0.70,
-                "ear_height": 0.05,
-                "cheek_fluff": 0.05,
-            },
-        ])
-
-    def build_cat_sprite(self, layer: str | None = None) -> dict | None:
-        if self.root_widget is None:
-            return None
-
-        variant = self.choose_cat_variant()
-        layer = "foreground"
-        size_bucket = random.random()
-        if size_bucket < 0.2:
-            size = random.randint(34, 50)
-        elif size_bucket < 0.55:
-            size = random.randint(54, 90)
-        else:
-            size = random.randint(96, 156)
-        label = CatSpriteLabel(self.root_widget)
-        label.setPixmap(self.create_cat_pixmap(size, variant))
-        label.setFixedSize(size, size)
-        label.setStyleSheet("background: transparent;")
-        label.clicked.connect(self.on_cat_clicked)
-        self.register_cursor_tracking(label)
-        label.show()
-        label.raise_()
-
-        x_limit = max(1, self.root_widget.width() - size)
-        y_limit = max(1, self.root_widget.height() - size)
-        sprite = {
-            "label": label,
-            "layer": layer,
-            "variant": variant,
-            "x": float(random.randint(0, x_limit)),
-            "y": float(random.randint(0, y_limit)),
-            "dx": random.choice([-1.0, 1.0]) * random.uniform(0.70, 1.35),
-            "dy": random.choice([-1.0, 1.0]) * random.uniform(0.18, 0.42),
-            "phase": random.uniform(0.0, 6.28),
-            "phase_step": random.uniform(0.07, 0.12),
-            "bob": random.uniform(0.10, 0.22),
-        }
-        label.setWindowOpacity(0.96)
-        label.move(int(sprite["x"]), int(sprite["y"]))
-        return sprite
-
-    def create_cat_sprites(self) -> None:
-        if self.cat_sprites or self.root_widget is None:
-            return
-
-        sprite_count = 8
-        for _ in range(sprite_count):
-            sprite = self.build_cat_sprite("foreground")
-            if sprite is not None:
-                self.cat_sprites.append(sprite)
-        self.position_cat_sprites()
-
-    def on_cat_clicked(self, label: QLabel) -> None:
-        if self.root_widget is None:
-            return
-        sprite = next((item for item in self.cat_sprites if item["label"] is label), None)
-        if sprite is None:
-            return
-
-        center = label.geometry().center()
-        PixelExplosion(self.root_widget, center, QColor(sprite["variant"]["fur"]))
-        self.play_kittycat_sound()
-        self.cat_sprites.remove(sprite)
-        label.hide()
-        label.deleteLater()
-
-        if self.cat_mode_enabled:
-            QTimer.singleShot(260, self.spawn_replacement_cat)
-
-    def spawn_replacement_cat(self) -> None:
-        if not self.cat_mode_enabled:
-            return
-        sprite = self.build_cat_sprite()
-        if sprite is None:
-            return
-        self.cat_sprites.append(sprite)
-        self.position_cat_sprites()
-
-    def remove_cat_sprites(self) -> None:
-        for sprite in self.cat_sprites:
-            label = sprite["label"]
-            label.hide()
-            label.deleteLater()
-        self.cat_sprites.clear()
-
-    def create_cat_pixmap(self, size: int, variant: dict) -> QPixmap:
-        pixmap = QPixmap(size, size)
-        pixmap.fill(Qt.GlobalColor.transparent)
-
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        outline = QColor(variant["outline"])
-        face_color = QColor(variant["fur"])
-        inner_ear = QColor(variant["ears"])
-        eye_color = QColor(variant["eyes"])
-        blush_color = QColor(variant["blush"])
-        face_scale = float(variant["face_scale"])
-        ear_height = float(variant["ear_height"])
-        cheek_fluff = float(variant["cheek_fluff"])
-
-        painter.setPen(QPen(outline, max(2, size // 26)))
-        painter.setBrush(face_color)
-        ear_left = QPolygon([
-            QPoint(int(size * 0.24), int(size * 0.36)),
-            QPoint(int(size * 0.38), int(size * ear_height)),
-            QPoint(int(size * 0.5), int(size * 0.34)),
-        ])
-        ear_right = QPolygon([
-            QPoint(int(size * 0.5), int(size * 0.34)),
-            QPoint(int(size * 0.63), int(size * ear_height)),
-            QPoint(int(size * 0.76), int(size * 0.36)),
-        ])
-        painter.drawPolygon(ear_left)
-        painter.drawPolygon(ear_right)
-
-        painter.setBrush(inner_ear)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawPolygon(QPolygon([
-            QPoint(int(size * 0.31), int(size * 0.31)),
-            QPoint(int(size * 0.39), int(size * 0.15)),
-            QPoint(int(size * 0.46), int(size * 0.31)),
-        ]))
-        painter.drawPolygon(QPolygon([
-            QPoint(int(size * 0.54), int(size * 0.31)),
-            QPoint(int(size * 0.61), int(size * 0.15)),
-            QPoint(int(size * 0.69), int(size * 0.31)),
-        ]))
-
-        painter.setPen(QPen(outline, max(2, size // 26)))
-        painter.setBrush(face_color)
-        face_width = int(size * face_scale)
-        face_height = int(size * (0.56 + cheek_fluff))
-        face_x = int((size - face_width) / 2)
-        face_y = int(size * (0.24 - cheek_fluff / 2))
-        painter.drawEllipse(face_x, face_y, face_width, face_height)
-
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(eye_color)
-        painter.drawEllipse(int(size * 0.34), int(size * 0.47), int(size * 0.08), int(size * 0.11))
-        painter.drawEllipse(int(size * 0.58), int(size * 0.47), int(size * 0.08), int(size * 0.11))
-
-        painter.setBrush(blush_color)
-        painter.drawEllipse(int(size * 0.23), int(size * 0.57), int(size * 0.12), int(size * 0.08))
-        painter.drawEllipse(int(size * 0.65), int(size * 0.57), int(size * 0.12), int(size * 0.08))
-
-        painter.setPen(QPen(outline, max(2, size // 30)))
-        painter.drawLine(int(size * 0.5), int(size * 0.53), int(size * 0.46), int(size * 0.59))
-        painter.drawLine(int(size * 0.5), int(size * 0.53), int(size * 0.54), int(size * 0.59))
-        painter.drawLine(int(size * 0.16), int(size * 0.54), int(size * 0.37), int(size * 0.56))
-        painter.drawLine(int(size * 0.16), int(size * 0.62), int(size * 0.37), int(size * 0.59))
-        painter.drawLine(int(size * 0.63), int(size * 0.56), int(size * 0.84), int(size * 0.54))
-        painter.drawLine(int(size * 0.63), int(size * 0.59), int(size * 0.84), int(size * 0.62))
-        painter.end()
-        return pixmap
-
-    def position_cat_sprites(self) -> None:
-        if self.root_widget is None:
-            return
-        width = self.root_widget.width()
-        height = self.root_widget.height()
-        for sprite in self.cat_sprites:
-            label = sprite["label"]
-            size = label.width()
-            x_limit = max(0, width - size)
-            y_limit = max(0, height - size)
-            x = max(0, min(int(sprite["x"]), x_limit))
-            y = max(0, min(int(sprite["y"]), y_limit))
-            label.move(x, y)
-            if sprite["layer"] == "foreground":
-                label.raise_()
-            else:
-                label.lower()
-
-    def tick_cat_sprites(self) -> None:
-        if self.root_widget is None or not self.cat_sprites:
-            return
-
-        width = self.root_widget.width()
-        height = self.root_widget.height()
-        for sprite in self.cat_sprites:
-            label = sprite["label"]
-            size = label.width()
-            x_limit = max(0, width - size)
-            y_limit = max(0, height - size)
-            sprite["phase"] += sprite["phase_step"]
-            sprite["x"] += sprite["dx"]
-            sprite["y"] += sprite["dy"] + (sprite["bob"] if sprite["phase"] % 6.28 < 3.14 else -sprite["bob"])
-
-            if sprite["x"] <= 0 or sprite["x"] >= x_limit:
-                sprite["dx"] *= -1
-                sprite["x"] = max(0, min(sprite["x"], x_limit))
-            if sprite["y"] <= 0 or sprite["y"] >= y_limit:
-                sprite["dy"] *= -1
-                sprite["y"] = max(0, min(sprite["y"], y_limit))
-
-            label.move(int(sprite["x"]), int(sprite["y"]))
-            if sprite["layer"] == "foreground":
-                label.raise_()
-            else:
-                label.lower()
 
     def make_field_label(self, text: str) -> QLabel:
         label = QLabel(text.upper())
@@ -3833,8 +3413,14 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
         self.update_responsive_layout()
-        self.position_kittycat_menu()
-        self.position_cat_sprites()
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        if self.tool_update_worker is not None:
+            self.tool_update_worker.cancel()
+        if self.tool_update_thread is not None and self.tool_update_thread.isRunning():
+            self.tool_update_thread.quit()
+            self.tool_update_thread.wait(1500)
+        super().closeEvent(event)
 
     def changeEvent(self, event) -> None:  # type: ignore[override]
         super().changeEvent(event)
@@ -3882,8 +3468,12 @@ class MainWindow(QMainWindow):
             return self.format_activity_message("Updates", "Checking for updates...")
         if text == "You already have the latest version.":
             return self.format_activity_message("Updates", "App is up to date.")
-        if text in {"Cat mode enabled.", "Cat mode disabled."}:
-            return None
+        if text.startswith("Downloading yt-dlp ") or text.startswith("Downloading TwitchDownloaderCLI "):
+            return self.format_activity_message("Updates", text)
+        if text.startswith("Updated yt-dlp ") or text.startswith("Updated TwitchDownloaderCLI "):
+            return self.format_activity_message("Updates", text)
+        if text == "Download backends are up to date.":
+            return self.format_activity_message("Updates", text)
         if text.startswith("Auto-fetching info for:"):
             return self.format_activity_message("Video", "Loading video details...")
         if text == "Starting metadata lookup...":
@@ -4048,7 +3638,17 @@ class MainWindow(QMainWindow):
         line_height = max(1.55, 1.9 * self.ui_scale)
         if message.startswith("\n[") or (message.startswith("[") and message.endswith("]")):
             color = "#888888"
-        if any(token in message.lower() for token in ["app is up to date", "download finished", "download complete", "loaded video", "duration:", "partial download removed"]):
+        if any(token in message.lower() for token in [
+            "app is up to date",
+            "download backends are up to date",
+            "updated yt-dlp",
+            "updated twitchdownloadercli",
+            "download finished",
+            "download complete",
+            "loaded video",
+            "duration:",
+            "partial download removed",
+        ]):
             color = "#c0ff33"
             weight = "500"
         return (
@@ -4086,6 +3686,23 @@ class MainWindow(QMainWindow):
     def on_full_video_toggled(self, checked: bool) -> None:
         self.start_input.setDisabled(checked)
         self.end_input.setDisabled(checked)
+
+    def on_start_time_edited(self, _: str) -> None:
+        self._start_time_autofilled = False
+
+    def on_end_time_changed(self, text: str) -> None:
+        stripped = text.strip()
+        if stripped:
+            if not self.start_input.text().strip():
+                self.start_input.blockSignals(True)
+                self.start_input.setText("0:00")
+                self.start_input.blockSignals(False)
+                self._start_time_autofilled = True
+        elif self._start_time_autofilled and self.start_input.text().strip() == "0:00":
+            self.start_input.blockSignals(True)
+            self.start_input.clear()
+            self.start_input.blockSignals(False)
+            self._start_time_autofilled = False
 
     def update_clip_range_placeholders(self) -> None:
         self.start_input.setPlaceholderText("0:00")
@@ -4166,20 +3783,6 @@ class MainWindow(QMainWindow):
             return
         audio_only_wav = self.wav_checkbox.isChecked()
         self.persist_user_settings()
-        target_output_path = self.resolve_output_path(output_dir, audio_only_wav=audio_only_wav)
-        if target_output_path.exists():
-            answer = QMessageBox.question(
-                self,
-                APP_TITLE,
-                f'"{target_output_path.name}" already exists.\n\nDo you want to overwrite it?',
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                return
-            target_output_path.unlink()
-            self.append_log(f"Removed existing file: {target_output_path}")
-        self.last_output_path = target_output_path
 
         start_text = self.start_input.text().strip()
         end_text = self.end_input.text().strip()
@@ -4198,8 +3801,15 @@ class MainWindow(QMainWindow):
         start_seconds: int | None = None
         end_seconds: int | None = None
         if not self.full_video_checkbox.isChecked():
-            if not start_text or not end_text:
-                self.show_error('Enter both start and end times, or enable "Download full range".')
+            if end_text and not start_text:
+                start_text = "0:00"
+                self.start_input.blockSignals(True)
+                self.start_input.setText(start_text)
+                self.start_input.blockSignals(False)
+                self._start_time_autofilled = True
+
+            if not end_text:
+                self.show_error('Enter an end time (start time defaults to 0:00), or enable "Download full range".')
                 return
 
             try:
@@ -4217,10 +3827,20 @@ class MainWindow(QMainWindow):
                 self.show_error("End time is longer than the video duration.")
                 return
 
-            section_value = f"*{format_seconds(start_seconds)}-{format_seconds(end_seconds)}"
             expected_duration = end_seconds - start_seconds
         else:
             self.append_log("Full range mode enabled.")
+
+        base_output_path = self.resolve_output_path(
+            output_dir,
+            audio_only_wav=audio_only_wav,
+            start_seconds=start_seconds,
+            end_seconds=end_seconds,
+        )
+        target_output_path = self.ensure_unique_output_path(base_output_path)
+        if target_output_path != base_output_path:
+            self.append_log(f"File already exists; saving as: {target_output_path.name}")
+        self.last_output_path = target_output_path
 
         self.is_downloading = True
         self.set_progress(0)
@@ -4229,7 +3849,13 @@ class MainWindow(QMainWindow):
         self.append_log("Starting download worker...")
         worker = DownloadWorker(
             url=url,
-            output_template=self.build_output_template(output_dir, audio_only_wav=audio_only_wav),
+            output_template=self.build_output_template(
+                output_dir,
+                audio_only_wav=audio_only_wav,
+                target_output_path=target_output_path,
+                start_seconds=start_seconds,
+                end_seconds=end_seconds,
+            ),
             output_path=str(target_output_path),
             ffmpeg_path=ffmpeg_path,
             expected_duration=expected_duration,
@@ -4267,6 +3893,7 @@ class MainWindow(QMainWindow):
         self.append_log(f"Loaded video: {title}")
         self.append_log(f"Duration: {format_seconds(self.video_duration)}")
         self.update_button_state()
+        self.apply_pending_yt_dlp_update_if_idle()
 
     def on_download_finished(self, result: object) -> None:
         self.is_downloading = False
@@ -4275,11 +3902,20 @@ class MainWindow(QMainWindow):
         if isinstance(result, dict) and result.get("cancelled"):
             self.cleanup_cancelled_download()
             self.append_log("Cancelled the current download and removed partial files.")
+            self.apply_pending_yt_dlp_update_if_idle()
             return
 
+        if isinstance(result, dict):
+            reported_output = str(result.get("output_path") or "").strip()
+            if reported_output:
+                reported_path = Path(reported_output)
+                if reported_path.is_file():
+                    self.last_output_path = reported_path
+
+        self.play_download_complete_sound()
         if self.reveal_checkbox.isChecked():
             self.reveal_in_explorer()
-        QMessageBox.information(self, APP_TITLE, "Download completed successfully.")
+        self.apply_pending_yt_dlp_update_if_idle()
 
     def on_dependencies_ready(self, result: object) -> None:
         self.dependencies_ready = True
@@ -4349,6 +3985,7 @@ class MainWindow(QMainWindow):
         self.is_downloading = False
         self.set_status(status)
         self.update_button_state()
+        self.apply_pending_yt_dlp_update_if_idle()
         self.show_error(message)
 
     def on_thread_finished(self) -> None:
@@ -4390,8 +4027,6 @@ class MainWindow(QMainWindow):
     def persist_user_settings(self) -> None:
         save_user_settings({
             "output_dir": self.output_dir_input.text().strip() or str(DEFAULT_OUTPUT_DIR),
-            "cat_mode": self.cat_mode_enabled,
-            "classic_ui": self.classic_ui_enabled,
             "audio_only_wav": self.wav_checkbox.isChecked() if hasattr(self, "wav_checkbox") else self.audio_only_wav_enabled,
         })
 
@@ -4442,8 +4077,12 @@ class MainWindow(QMainWindow):
     def queue_startup_update_check(self) -> None:
         if self.update_config.get("check_on_startup", True):
             QTimer.singleShot(1500, lambda: self.check_for_updates(silent=True))
+        QTimer.singleShot(2500, lambda: self.check_for_tool_updates(force=False, silent=True))
 
     def check_for_updates(self, silent: bool = False) -> None:
+        if not silent:
+            self.check_for_tool_updates(force=True, silent=False)
+
         if self.is_checking_updates or self.is_installing_update:
             return
 
@@ -4527,11 +4166,134 @@ class MainWindow(QMainWindow):
 
         QTimer.singleShot(250, QApplication.instance().quit)
 
+    def check_for_tool_updates(self, force: bool = False, silent: bool = True) -> None:
+        if self.is_checking_tool_updates or self.tool_update_thread is not None:
+            return
+        self.is_checking_tool_updates = True
+        worker = ToolUpdateWorker(
+            current_yt_dlp_version=active_yt_dlp_version(),
+            current_ejs_version=tool_updater.detect_active_ejs_version(),
+            force=force,
+            silent=silent,
+        )
+        self.run_tool_update_worker(
+            worker,
+            self.on_tool_updates_finished,
+            lambda message: self.on_tool_update_error(message, silent=silent),
+        )
+
+    def run_tool_update_worker(self, worker: ToolUpdateWorker, success_handler, error_handler) -> None:
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        self.tool_update_thread = thread
+        self.tool_update_worker = worker
+        worker.signals.log.connect(self.append_log)
+        worker.signals.finished.connect(success_handler)
+        worker.signals.finished.connect(thread.quit)
+        worker.signals.finished.connect(worker.deleteLater)
+        worker.signals.error.connect(error_handler)
+        worker.signals.error.connect(thread.quit)
+        worker.signals.error.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self.on_tool_update_thread_finished)
+        thread.started.connect(worker.run)
+        thread.start()
+
+    def on_tool_updates_finished(self, result: object) -> None:
+        self.is_checking_tool_updates = False
+        if not isinstance(result, dict):
+            return
+        outcomes = result.get("outcomes")
+        silent = bool(result.get("silent", True))
+        if not isinstance(outcomes, list):
+            return
+
+        any_updated = False
+        any_errors = False
+        for outcome in outcomes:
+            if not isinstance(outcome, ToolUpdateOutcome):
+                continue
+            if outcome.tool == "yt-dlp" and outcome.status == "updated" and outcome.installed_path:
+                any_updated = True
+                self._pending_yt_dlp_reload = True
+                self._pending_yt_dlp_root = Path(outcome.installed_path)
+                self._pending_yt_dlp_version = str(outcome.latest_version or "")
+                if self.is_downloading or self.is_fetching_info:
+                    self.append_log(
+                        f"Updated yt-dlp to {self._pending_yt_dlp_version} (will activate after current task)."
+                    )
+                else:
+                    self.apply_pending_yt_dlp_update_if_idle()
+            elif outcome.tool == "TwitchDownloaderCLI" and outcome.status == "updated":
+                any_updated = True
+                self.append_log(f"Updated TwitchDownloaderCLI to {outcome.latest_version}.")
+            elif outcome.status == "error" and outcome.message:
+                any_errors = True
+                if silent:
+                    self.write_raw_log(outcome.message)
+                else:
+                    self.append_log(outcome.message)
+            elif outcome.message:
+                self.write_raw_log(outcome.message)
+
+        if not silent and not any_updated and not any_errors:
+            self.append_log("Download backends are up to date.")
+
+    def on_tool_update_error(self, message: str, silent: bool) -> None:
+        self.is_checking_tool_updates = False
+        if silent:
+            self.write_raw_log(message)
+        else:
+            self.append_log(message)
+
+    def on_tool_update_thread_finished(self) -> None:
+        self.tool_update_thread = None
+        self.tool_update_worker = None
+
+    def apply_pending_yt_dlp_update_if_idle(self) -> None:
+        if not self._pending_yt_dlp_reload or self.is_downloading or self.is_fetching_info:
+            return
+        target_root = self._pending_yt_dlp_root
+        target_version = self._pending_yt_dlp_version
+        self._pending_yt_dlp_reload = False
+        self._pending_yt_dlp_root = None
+        self._pending_yt_dlp_version = ""
+        if target_root is None:
+            return
+        try:
+            active_version = reload_yt_dlp_runtime(target_root)
+            tool_updater.prune_unused_directories(tool_updater.managed_tools_dir() / "python", target_root)
+            self.append_log(f"Updated yt-dlp to {active_version}.")
+        except Exception as error:  # noqa: BLE001
+            self.write_raw_log(f"Could not activate yt-dlp {target_version}; kept previous runtime: {error}")
+
+    def play_download_complete_sound(self) -> None:
+        if winsound is not None:
+            try:
+                winsound.MessageBeep(winsound.MB_ICONASTERISK)
+                return
+            except RuntimeError:
+                pass
+        QApplication.beep()
+
     def reveal_in_explorer(self) -> None:
-        output_dir = Path(self.output_dir_input.text().strip() or DEFAULT_OUTPUT_DIR)
+        target_file = self.last_output_path
+        if IS_WINDOWS and target_file is not None and target_file.is_file():
+            try:
+                resolved = str(target_file.resolve())
+                subprocess.Popen(f'explorer.exe /select,"{resolved}"')
+                return
+            except OSError:
+                pass
+        output_dir = (
+            target_file.parent
+            if target_file is not None and target_file.parent.exists()
+            else Path(self.output_dir_input.text().strip() or DEFAULT_OUTPUT_DIR)
+        )
         if not output_dir.exists():
             return
-        os.startfile(str(output_dir))
+        if hasattr(os, "startfile"):
+            os.startfile(str(output_dir))
 
     def start_dependency_check(self) -> None:
         self.append_log("Looking for yt-dlp and ffmpeg...")
@@ -4594,45 +4356,6 @@ class MainWindow(QMainWindow):
         thread.started.connect(worker.run)
         thread.start()
 
-    def resolve_yt_dlp_command(self, require_ffmpeg: bool = False) -> list[str] | None:
-        module_spec = shutil.which("yt-dlp")
-        if self.is_frozen():
-            packaged_dir = Path(sys.executable).resolve().parent
-            candidates = [
-                packaged_dir / "yt-dlp.exe",
-                packaged_dir / "_internal" / "yt-dlp.exe",
-            ]
-            for candidate in candidates:
-                if candidate.exists():
-                    command = [str(candidate)]
-                    break
-            else:
-                command = None
-        elif self.python_has_yt_dlp():
-            command = [sys.executable, "-m", "yt_dlp"]
-        elif module_spec:
-            command = [module_spec]
-        else:
-            command = None
-
-        if not command:
-            self.append_log("yt-dlp was not found in the packaged app or on PATH.")
-            self.show_error(
-                "yt-dlp is not installed.\n\n"
-                "Run: pip install yt-dlp\n"
-                "or install the yt-dlp executable and add it to PATH."
-            )
-            return None
-
-        if require_ffmpeg and not self.resolve_ffmpeg_executable():
-            self.show_error(
-                "ffmpeg could not be prepared automatically.\n\n"
-                "This app needs ffmpeg to merge the best video+audio and cut exact sections."
-            )
-            return None
-
-        return command
-
     def python_has_yt_dlp(self) -> bool:
         try:
             importlib.import_module("yt_dlp")
@@ -4645,21 +4368,65 @@ class MainWindow(QMainWindow):
             return self.ffmpeg_path
         return DependencyWorker().resolve_ffmpeg_executable()
 
-    def build_output_template(self, output_dir: Path, audio_only_wav: bool = False) -> str:
+    def is_using_auto_filename(self, requested_name: str) -> bool:
+        return not requested_name or (bool(self.last_auto_filename) and requested_name == self.last_auto_filename)
+
+    def ensure_unique_output_path(self, target_path: Path) -> Path:
+        if not target_path.exists():
+            return target_path
+        stem = target_path.stem
+        suffix = target_path.suffix
+        parent = target_path.parent
+        counter = 2
+        while True:
+            candidate = parent / f"{stem} ({counter}){suffix}"
+            if not candidate.exists():
+                return candidate
+            counter += 1
+
+    def build_output_template(
+        self,
+        output_dir: Path,
+        audio_only_wav: bool = False,
+        target_output_path: Path | None = None,
+        start_seconds: int | None = None,
+        end_seconds: int | None = None,
+    ) -> str:
         requested_name = self.filename_input.text().strip()
-        if requested_name:
-            safe_name = self.normalize_output_stem(requested_name)
-            return str(output_dir / f"{safe_name}.%(ext)s")
+        if requested_name or self.video_title:
+            if target_output_path is not None:
+                return str(target_output_path.with_suffix(".%(ext)s"))
+            resolved = self.resolve_output_path(
+                output_dir,
+                audio_only_wav=audio_only_wav,
+                start_seconds=start_seconds,
+                end_seconds=end_seconds,
+            )
+            return str(resolved.with_suffix(".%(ext)s"))
+        if start_seconds is not None and end_seconds is not None:
+            range_tag = format_range_filename_tag(start_seconds, end_seconds)
+            return str(output_dir / f"%(title)s {range_tag}.%(ext)s")
         return str(output_dir / "%(title)s.%(ext)s")
 
-    def resolve_output_path(self, output_dir: Path, audio_only_wav: bool = False) -> Path:
+    def resolve_output_path(
+        self,
+        output_dir: Path,
+        audio_only_wav: bool = False,
+        start_seconds: int | None = None,
+        end_seconds: int | None = None,
+    ) -> Path:
         requested_name = self.filename_input.text().strip()
+        auto_named = self.is_using_auto_filename(requested_name)
         if requested_name:
             filename = self.normalize_output_stem(requested_name)
         elif self.video_title:
             filename = self.sanitize_filename(self.video_title)
         else:
             filename = "download"
+        if auto_named and start_seconds is not None and end_seconds is not None:
+            range_tag = format_range_filename_tag(start_seconds, end_seconds)
+            base_stem = filename[:160].rstrip(". ") or "clip"
+            filename = f"{base_stem} {range_tag}"
         extension = "wav" if audio_only_wav else "mp4"
         return output_dir / f"{filename}.{extension}"
 

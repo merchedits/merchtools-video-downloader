@@ -60,6 +60,89 @@ class DownloadRuntimeTests(unittest.TestCase):
         self.assertEqual(app.FFmpegPostProcessor._ffmpeg_location.get(), original)
         self.assertIs(app.yt_dlp_external.Popen, original_popen)
 
+    def test_hardware_encoder_failure_detection(self):
+        self.assertTrue(
+            app.is_hardware_encoder_failure(
+                "ERROR: ffmpeg exited with code 1",
+                ["[h264_nvenc @ 0x1] OpenEncodeSessionEx failed: out of memory"],
+                "h264_nvenc",
+            )
+        )
+        self.assertFalse(
+            app.is_hardware_encoder_failure(
+                "ERROR: HTTP Error 403 Forbidden",
+                ["[https] 403 Forbidden"],
+                "h264_nvenc",
+            )
+        )
+        self.assertFalse(
+            app.is_hardware_encoder_failure(
+                "ERROR: ffmpeg exited with code 1",
+                ["Generic error"],
+                None,
+            )
+        )
+
+    def test_download_retries_with_cpu_when_hardware_encoder_fails(self):
+        attempts = []
+        finished = []
+        errors = []
+        self.worker.use_hardware_acceleration = True
+        self.worker.signals.finished.connect(finished.append)
+        self.worker.signals.error.connect(errors.append)
+
+        def fake_standard_download():
+            attempts.append(self.worker.use_hardware_acceleration)
+            if self.worker.use_hardware_acceleration:
+                self.worker.active_hardware_encoder = "h264_nvenc"
+                self.worker.ffmpeg_error_lines.append("[h264_nvenc] Driver does not support the required nvenc API version")
+                raise app.DownloadError("ERROR: ffmpeg exited with code 1")
+            return 0
+
+        with (
+            patch.object(self.worker, "run_standard_download", side_effect=fake_standard_download),
+            patch.dict(app.HARDWARE_ENCODER_CACHE, {"ffmpeg.exe": "h264_nvenc"}, clear=False),
+        ):
+            self.worker.run()
+            self.assertIsNone(app.HARDWARE_ENCODER_CACHE.get("ffmpeg.exe"))
+
+        self.assertEqual(attempts, [True, False])
+        self.assertEqual(errors, [])
+        self.assertEqual(len(finished), 1)
+        self.assertTrue(finished[0]["ok"])
+
+    def test_trim_local_clip_retries_with_cpu_on_hardware_failure(self):
+        from pathlib import Path
+        import tempfile
+
+        commands = []
+
+        class FakeProc:
+            def __init__(self, args, **kwargs):
+                commands.append(args)
+                self._failed = "h264_nvenc" in args
+                self.stderr = iter(["[h264_nvenc] OpenEncodeSessionEx failed\n"] if self._failed else [])
+
+            def wait(self):
+                return 1 if self._failed else 0
+
+        self.worker.use_hardware_acceleration = True
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src.mp4"
+            out = Path(tmp) / "out.mp4"
+            src.write_bytes(b"src")
+            with (
+                patch.object(app.subprocess, "Popen", side_effect=FakeProc),
+                patch.dict(app.HARDWARE_ENCODER_CACHE, {"ffmpeg.exe": "h264_nvenc"}, clear=False),
+            ):
+                code = self.worker.trim_local_clip(src, out)
+                self.assertIsNone(app.HARDWARE_ENCODER_CACHE.get("ffmpeg.exe"))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(commands), 2)
+        self.assertIn("h264_nvenc", commands[0])
+        self.assertNotIn("h264_nvenc", commands[1])
+
 
 if __name__ == "__main__":
     unittest.main()

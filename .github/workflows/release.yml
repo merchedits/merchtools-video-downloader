@@ -1,0 +1,173 @@
+name: Build and Release Windows Installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_notes:
+        description: Optional custom release notes markdown
+        required: false
+        default: ""
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows-release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install build and test dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --user --upgrade pip
+          python -m pip install --user --upgrade -r build_requirements.txt
+
+      - name: Run unit test suite
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          python -m unittest discover -s tests -v
+
+      - name: Build packaged Windows application
+        shell: pwsh
+        run: |
+          .\build.ps1 -SkipLatestVersionCheck
+
+      - name: Smoke-test packaged bundle
+        shell: pwsh
+        run: |
+          $meta = python -c "import json; from app_metadata import APP_TITLE, APP_VERSION; print(json.dumps({'title': APP_TITLE, 'version': APP_VERSION}))" | ConvertFrom-Json
+          $version = [string]$meta.version
+          $title = [string]$meta.title
+          $distDir = Join-Path (Get-Location) "dist-fresh\$version\$title"
+          $exePath = Join-Path $distDir "$title.exe"
+          if (-not (Test-Path $exePath)) { throw "Missing executable: $exePath" }
+
+          $nodePath = @(
+            (Join-Path $distDir "node.exe"),
+            (Join-Path $distDir "_internal\node.exe")
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $nodePath) { throw "Missing bundled node.exe" }
+
+          $ffmpegPath = @(
+            (Join-Path $distDir "ffmpeg.exe"),
+            (Join-Path $distDir "_internal\ffmpeg.exe")
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $ffmpegPath) { throw "Missing bundled ffmpeg.exe" }
+
+          $tdPath = @(
+            (Join-Path $distDir "TwitchDownloaderCLI\TwitchDownloaderCLI.exe"),
+            (Join-Path $distDir "_internal\TwitchDownloaderCLI\TwitchDownloaderCLI.exe")
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $tdPath) { throw "Missing bundled TwitchDownloaderCLI.exe" }
+
+          $bgutilScript = @(
+            (Join-Path $distDir "bgutil-ytdlp-pot-provider\server\build\generate_once.js"),
+            (Join-Path $distDir "_internal\bgutil-ytdlp-pot-provider\server\build\generate_once.js")
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $bgutilScript) { throw "Missing bundled bgutil generate_once.js" }
+
+          $bgutilVersion = (& $nodePath $bgutilScript --version).Trim()
+          Write-Host "Bundled bgutil script version: $bgutilVersion"
+          if ($LASTEXITCODE -ne 0 -or -not $bgutilVersion.StartsWith("2.0.2")) {
+            throw "Bundled bgutil script failed version check: $bgutilVersion"
+          }
+
+          $tdOut = (& $tdPath --version 2>&1) -join "`n"
+          Write-Host "Bundled TwitchDownloaderCLI output: $tdOut"
+          if ($tdOut -notmatch "1\.56\.5") {
+            throw "Bundled TwitchDownloaderCLI did not report expected version 1.56.5"
+          }
+
+          "APP_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "APP_TITLE=$title" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "DIST_DIR=$distDir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Create portable ZIP archive
+        shell: pwsh
+        run: |
+          $zipPath = Join-Path (Get-Location) "MerchToolsVideoDownloader-$env:APP_VERSION-portable.zip"
+          if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+          Compress-Archive -Path $env:DIST_DIR -DestinationPath $zipPath -CompressionLevel Optimal
+          "PORTABLE_ZIP=$zipPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Ensure Inno Setup 6 is installed
+        shell: pwsh
+        run: |
+          $iscc = @(
+            (Get-Command iscc -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue),
+            "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+            "C:\Program Files\Inno Setup 6\ISCC.exe"
+          ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
+          if (-not $iscc) {
+            choco install innosetup -y --no-progress
+          }
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: |
+          .\build_installer.ps1 -SkipLatestVersionCheck
+          $setupExe = Join-Path (Get-Location) "installer-dist\MerchToolsVideoDownloaderSetup.exe"
+          if (-not (Test-Path $setupExe)) { throw "Missing installer output: $setupExe" }
+          "SETUP_EXE=$setupExe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CUSTOM_NOTES: ${{ github.event.inputs.release_notes }}
+        run: |
+          $tag = "v$env:APP_VERSION"
+          $notesFile = Join-Path (Get-Location) "release-notes.md"
+          if ($env:CUSTOM_NOTES -and $env:CUSTOM_NOTES.Trim()) {
+            $env:CUSTOM_NOTES | Set-Content -Path $notesFile -Encoding utf8
+          } else {
+            @(
+              "## What's Changed in $tag"
+              ''
+              '- Auto-fills `0:00` in Start Time when you enter an End Time.'
+              '- Replaced the blocking download-completed modal popup with a non-blocking notification sound.'
+              '- Removed the Secret Menu (Kittycat and Classic UI options).'
+              '- Added automatic background updates for `yt-dlp` (+ `yt-dlp-ejs`) and `TwitchDownloaderCLI` inside user app data so extractor fixes apply without shipping a new installer.'
+              '- `Reveal in Explorer` now selects the exact downloaded file on Windows.'
+              '- Auto-generated clip filenames include the clip range (`Title [00-00 - 00-10].mp4`) and auto-increment duplicate names instead of prompting to overwrite.'
+              '- Automatically retries with CPU encoding if hardware encoding fails at runtime.'
+              '- Refreshed bundled `bgutil-ytdlp-pot-provider` to `2.0.2`, `TwitchDownloaderCLI` to `1.56.5`, and `yt-dlp` to `2026.10.26`.'
+              ''
+              "Download **MerchToolsVideoDownloaderSetup.exe** to install or upgrade, or extract **MerchToolsVideoDownloader-$env:APP_VERSION-portable.zip** to run portable."
+            ) -join "`n" | Set-Content -Path $notesFile -Encoding utf8
+          }
+
+          $exists = $false
+          try {
+            gh release view $tag *> $null
+            if ($LASTEXITCODE -eq 0) { $exists = $true }
+          } catch {
+            $exists = $false
+          }
+
+          if ($exists) {
+            gh release edit $tag --title "$tag - MerchTools Video Downloader" --notes-file $notesFile
+            gh release upload $tag $env:SETUP_EXE $env:PORTABLE_ZIP --clobber
+          } else {
+            gh release create $tag $env:SETUP_EXE $env:PORTABLE_ZIP `
+              --title "$tag - MerchTools Video Downloader" `
+              --notes-file $notesFile `
+              --latest
+          }
