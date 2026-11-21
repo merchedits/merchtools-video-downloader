@@ -52,15 +52,43 @@ if (-not $SkipLatestVersionCheck -and (Test-Path $LatestJsonPath)) {
     }
 }
 
-& "$IsccPath" `
-    "/DMyAppName=$AppName" `
-    "/DMyAppVersion=$AppVersion" `
-    "/DMyAppPublisher=$AppPublisher" `
-    "/DMyAppExeName=$AppExeName" `
-    "/DMyAppSourceDir=$AppSourceDir" `
-    (Join-Path $ProjectRoot "installer.iss")
-if ($LASTEXITCODE -ne 0) {
-    throw "Inno Setup build failed with exit code $LASTEXITCODE"
+$FullSourceDir = (Resolve-Path (Join-Path $ProjectRoot $AppSourceDir)).Path
+$DriveRoot = [System.IO.Path]::GetPathRoot($FullSourceDir)
+$ShortJunction = Join-Path $DriveRoot ("mt-inno-" + [System.Diagnostics.Process]::GetCurrentProcess().Id)
+$InnoSourceDir = $AppSourceDir
+$CreatedJunction = $false
+
+try {
+    if ($FullSourceDir.Length -gt 40) {
+        try {
+            if (Test-Path -LiteralPath $ShortJunction) {
+                [System.IO.Directory]::Delete($ShortJunction, $false)
+            }
+            New-Item -ItemType Junction -Path $ShortJunction -Target $FullSourceDir | Out-Null
+            $CreatedJunction = $true
+            $InnoSourceDir = $ShortJunction
+        }
+        catch {
+            $CreatedJunction = $false
+            $InnoSourceDir = $AppSourceDir
+        }
+    }
+
+    & "$IsccPath" `
+        "/DMyAppName=$AppName" `
+        "/DMyAppVersion=$AppVersion" `
+        "/DMyAppPublisher=$AppPublisher" `
+        "/DMyAppExeName=$AppExeName" `
+        "/DMyAppSourceDir=$InnoSourceDir" `
+        (Join-Path $ProjectRoot "installer.iss")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Inno Setup build failed with exit code $LASTEXITCODE"
+    }
+}
+finally {
+    if ($CreatedJunction -and (Test-Path -LiteralPath $ShortJunction)) {
+        [System.IO.Directory]::Delete($ShortJunction, $false)
+    }
 }
 
 Write-Host ""

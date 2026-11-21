@@ -113,6 +113,7 @@ try {
     }
 
     Get-ChildItem -Path (Join-Path $BgutilProviderServer "build") -Filter *.map -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    Get-ChildItem -Path (Join-Path $BgutilProviderServer "node_modules") -Recurse -File -Include *.map,*.d.ts,*.d.mts,*.d.cts -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
     Remove-Item -Force (Join-Path $BgutilProviderServer "tsconfig.tsbuildinfo") -ErrorAction SilentlyContinue
 }
 finally {
