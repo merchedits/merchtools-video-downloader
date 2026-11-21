@@ -90,6 +90,7 @@ jobs:
           }
 
           $tdOut = (& $tdPath --version 2>&1) -join "`n"
+          $global:LASTEXITCODE = 0
           Write-Host "Bundled TwitchDownloaderCLI output: $tdOut"
           if ($tdOut -notmatch "1\.56\.5") {
             throw "Bundled TwitchDownloaderCLI did not report expected version 1.56.5"
